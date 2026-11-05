@@ -8,7 +8,7 @@ Lokale OCR für PDFs und Bilder über einen **Lemonade Server** (AMD, OpenAI-kom
 - `ocr.py`: Kernlogik und Kommandozeile mit `argparse` (`python ocr.py <Modell> [Datei ...] [-e EINGABE] [-o AUSGABE] [--ueberwachen] [-p PROMPT] [--pdf] [--docx] [--odt]`). Die alte Form mit dem Prompt als drittem Positionsargument bleibt erlaubt, wenn es keine Datei ist und nicht wie ein Dateiname aussieht.
 - `ocr_gui.pyw`: Qt-Oberfläche (PySide6, läuft unter Linux nativ auf Wayland), importiert `ocr.py` aus demselben Ordner und nutzt `ocr.verbinden()`, `ocr.modelle_auflisten()`, `ocr.verarbeiten()`, `ocr.offene_dateien()`, `ocr.Wartezimmer` und `ocr.Fortschritt`. Arbeit läuft in einem `threading.Thread`, Kommunikation über eine `queue.Queue`, die ein `QTimer` (100 ms) abholt; ein zweiter `QTimer` (500 ms) zeichnet die Live-Anzeige
 - `tests/`: `unittest`-Tests ohne Server (`testseite.py` = Testseite, Scan und Fake-grounding-Antwort; `test_ocr.py`; `test_gui.py` braucht Display)
-- `docs/Anleitung.docx`: ausführliche Anleitung für Endnutzer (Windows 11, Kapitel 9 Linux/Fedora). Ohne Quelltext-Anhang und ohne Paperless-Kapitel (Wunsch von Tobias, 2026-11-05); die Dateien kommen aus dem Projekt-Download.
+- `docs/Anleitung.docx`: ausführliche Anleitung für Endnutzer (Windows 11, Kapitel 9 Linux/Fedora und Linux Mint). Ohne Quelltext-Anhang und ohne Paperless-Kapitel (Wunsch von Tobias, 2026-11-05); die Dateien kommen aus dem Projekt-Download.
 
 Abhängigkeiten: `openai`, `pymupdf` (Import als `import pymupdf as fitz`), `PySide6` (nur für die GUI, von Tobias am 2026-11-05 freigegeben, ersetzt Tkinter), Python ≥ 3.10, optional Pandoc.
 
@@ -46,6 +46,7 @@ Es gibt keinen echten Server in CI. Die Tests liegen in `tests/` und laufen mit 
 ## Grenzen / mögliche nächste Schritte
 - Die Textebene ist zeilen-, nicht wortgenau.
 - Linux: Beim Lemonade-RPM ist der Server `lemond` (systemd-Dienst `lemond.service`), `lemonade` ist nur ein Client.
+- Linux Mint/Ubuntu: Lemonade-PPA `ppa:lemonade-team/stable` wird nur für Ubuntu 24.04+ gebaut, also Mint ab 22 (Mint 21 nur per Snap). Unter Mint ist `pip install --user` gesperrt (PEP 668), deshalb venv; PySide6 braucht unter X11 `libxcb-cursor0`.
 - Der Eingabe-Ordner wird ohne Unterordner durchsucht. Verarbeitete Originale bleiben liegen (kein Verschieben).
 - Mögliche Erweiterungen: Paperless-Integration, englische Übersetzung von README und Oberfläche.
 

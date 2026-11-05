@@ -20,7 +20,7 @@ Lokale Texterkennung (OCR) für PDFs und Bilder mit **LightOnOCR-3** über einen
 
 | | |
 |---|---|
-| Betriebssystem | Windows 11 oder Linux (getestet mit KDE/Wayland) |
+| Betriebssystem | Windows 11 oder Linux (getestet mit KDE/Wayland), z. B. Fedora oder Linux Mint ab 22 |
 | Grafikkarte | ab 8 GB VRAM, mit 16 GB läuft das 4B-Modell in bester Qualität. Ohne eigene Grafikkarte läuft es auf dem Prozessor, aber deutlich langsamer (dann das 0.8B-Modell nehmen) |
 | Software | [Lemonade](https://lemonade-server.ai/), Python ab 3.10 mit `openai`, `pymupdf` und `PySide6`, optional [Pandoc](https://pandoc.org/) für Word/LibreOffice |
 
@@ -68,6 +68,29 @@ Beim Lemonade-Paket für Linux sind `lemonade` und `lemonade-web-app` nur Client
 systemctl --user start lemond            # nur für diese Sitzung
 systemctl --user enable --now lemond     # oder: bei jeder Anmeldung automatisch
 lemonade status
+```
+
+### Linux Mint / Ubuntu
+
+Lemonade gibt es für Ubuntu als PPA, gebaut nur für Ubuntu 24.04 und neuer. Nötig ist deshalb **Linux Mint 22 oder neuer** (Mint 22.x beruht auf Ubuntu 24.04). Mint 21.x geht nur über Snap: `sudo rm /etc/apt/preferences.d/nosnap.pref`, dann `sudo apt install snapd` und `sudo snap install lemonade-server`.
+
+```bash
+sudo add-apt-repository ppa:lemonade-team/stable
+sudo apt update
+sudo apt install lemonade-server
+
+sudo systemctl start lemond              # bei Bedarf starten (Systemdienst)
+sudo systemctl disable --now lemond      # falls das Paket einen Autostart eingeschaltet hat
+lemonade status
+```
+
+`pip install --user` ist unter Mint gesperrt (`externally-managed-environment`), deshalb eine eigene Umgebung. `libxcb-cursor0` braucht Qt unter X11 (Standard bei Mint mit Cinnamon):
+
+```bash
+sudo apt install python3-venv pandoc fonts-dejavu-core libxcb-cursor0
+python3 -m venv ~/ocr-umgebung
+~/ocr-umgebung/bin/pip install -r requirements.txt
+~/ocr-umgebung/bin/python ocr_gui.pyw
 ```
 
 Läuft Lemonade auf einem anderen Rechner im Heimnetz (zum Beispiel einem PC mit Grafikkarte), trägst du dessen Adresse in der Oberfläche ein oder nutzt `--url`.
