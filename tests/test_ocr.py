@@ -177,10 +177,13 @@ class GanzeSeiteAlsBildTest(Grundlage):
         self.assertNotIn("Kein Text erkannt", md)
 
     def test_unbrauchbar(self):
-        for text in ('"\n' * 73, "....................", "ab\n" * 12, '" " " "\n" "'):
+        frage = "".join(f"{i}. Welche Verbindung ist ein Kohlenwasserstoff?\n   A. Ethanol\n   B. Ethen\n"
+                        "   C. Essigsäure\n   D. Glucose\n\n" for i in range(1, 21))
+        for text in ('"\n' * 73, "....................", "ab\n" * 12, '" " " "\n" "', frage):
             self.assertTrue(ocr.unbrauchbar(text), text)
         for text in ("", "1", "Datum: 03.03.", "| 1 | 2 |\n|---|---|\n| 3 | 4 |",
-                     self.antwort, "Ja\nNein\n" * 3):
+                     self.antwort, "Ja\nNein\n" * 3,
+                     "\n".join(f"| {i} | Position {i} | {i * 3},50 € |" for i in range(40))):
             self.assertFalse(ocr.unbrauchbar(text), text)
 
     def test_anderer_prompt_ohne_zweiten_versuch(self):

@@ -346,7 +346,12 @@ def unbrauchbar(text: str) -> bool:
     if len(zeichen) >= 20 and buchstaben < 0.1 * len(zeichen):
         return True
     zeilen = [z.strip() for z in text.splitlines() if z.strip()]
-    return len(zeilen) >= 10 and len(set(zeilen)) <= 2 and all(len(z) <= 5 for z in zeilen)
+    if len(zeilen) >= 10 and len(set(zeilen)) <= 2 and all(len(z) <= 5 for z in zeilen):
+        return True
+    # Derselbe Abschnitt immer wieder, nur anders nummeriert (z. B. 20-mal die
+    # gleiche Frage mit "1.", "2.", …): kaum verschiedene Zeilen bei vielen Zeilen
+    ohne_nummer = {re.sub(r"^[\d.)\s]+", "", z) for z in zeilen}
+    return len(zeilen) >= 30 and len(ohne_nummer) < 0.15 * len(zeilen)
 
 
 def _pruefen(antwort: str, bloecke):
@@ -380,7 +385,8 @@ def seite_erkennen(modell: str, png: bytes, prompt: str, empfangen=None, melden=
         zweite_bloecke = bildverweise_entfernen(bloecke_parsen(zweite))
         if textinhalt(zweite_bloecke) and not _pruefen(zweite, zweite_bloecke):
             return zweite, zweite_bloecke, None
-        melden("   Auch im zweiten Versuch kein Text erkannt.")
+        melden("   Auch im zweiten Versuch kein Text erkannt. Passiert das bei jedem Bild, sieht das "
+               "Modell das Bild wahrscheinlich nicht: in Lemonade prüfen, ob das MMProj geladen ist.")
     if hinweis == UNBRAUCHBAR:
         # Bilder behalten, den unbrauchbaren Text verwerfen
         bloecke = [(typ, box, inhalt if typ in BILD_TYPEN else "") for typ, box, inhalt in bloecke]

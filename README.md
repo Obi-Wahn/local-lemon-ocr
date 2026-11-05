@@ -172,7 +172,7 @@ Details stehen in der [ausführlichen Anleitung](docs/Anleitung.docx).
 | model not found | Modellnamen mit bzw. ohne `user.` versuchen |
 | „returned no visible answer“ / leere Ausgabe | `--reasoning off` in den Modell-Einstellungen |
 | `[WARNUNG: Ausgabe abgeschnitten]` | Kontextgröße erhöhen (16384 oder mehr) |
-| Bild wird ignoriert | Modell ohne MMProj geladen, neu herunterladen |
+| Bild wird ignoriert, Antwort hat nichts mit dem Bild zu tun (z. B. fremdsprachiger Text, immer dieselbe Frage) oder `[Kein Text erkannt …]` bei jedem Bild | Das Modell sieht das Bild nicht, meist fehlt das MMProj. In Lemonade unter **Models** prüfen, ob beim Modell „Vision projector (MMProj)“ steht, und das Bild im Chat der Lemonade-App testen („Was steht auf dem Bild?“). Sonst Modell löschen und neu herunterladen |
 | Bild abgeschnitten | in `ocr.py` den Wert `rand = 4` erhöhen |
 | `✖ Seite N nicht erkannt` | Zeitüberschreitung oder Serverfehler bei dieser Seite. Die übrigen Seiten sind gespeichert. Datei später erneut verarbeiten (im Eingabe-Ordner passiert das beim nächsten Start automatisch) |
 | `[UNVOLLSTÄNDIG: …]` im Ergebnis | Verarbeitung wurde abgebrochen oder die Verbindung ist abgerissen. Datei erneut verarbeiten |
