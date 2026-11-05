@@ -268,7 +268,19 @@ def seitenfehler(fehler: Exception) -> bool:
     if isinstance(fehler, (openai.APIConnectionError, openai.AuthenticationError,
                            openai.PermissionDeniedError, openai.NotFoundError)):
         return False
-    return isinstance(fehler, openai.APIStatusError)
+    # APIError ohne Statuscode: Der Server hat mitten in der gestreamten
+    # Antwort einen Fehler geschickt (z. B. Vulkan "ErrorDeviceLost")
+    return isinstance(fehler, openai.APIError)
+
+
+def fehler_hinweis(fehler: Exception) -> str:
+    """Zusätzlicher Hinweis zu bekannten Serverfehlern, sonst leer."""
+    text = str(fehler)
+    if "DeviceLost" in text or "vk::" in text:
+        return ("Die Grafikkarte (Vulkan) ist im Lemonade Server abgestürzt. Server neu starten "
+                "(Linux: systemctl --user restart lemond) und bei schwacher Grafik in Lemonade "
+                "das CPU-Backend wählen.")
+    return ""
 
 
 # ------------------------------------------------------- Grounding-Format ---
@@ -784,6 +796,8 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
                 if not seitenfehler(f):
                     raise
                 melden(f"   ✖ Seite {nr} nicht erkannt: {f}")
+                if fehler_hinweis(f):
+                    melden(f"     {fehler_hinweis(f)}")
                 fehlend.append(nr)
                 teile.append(f"## Seite {nr}\n\n*{SEITE_FEHLT} – {type(f).__name__}]*")
                 fertig = nr
