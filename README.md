@@ -5,6 +5,8 @@ Lokale Texterkennung (OCR) für PDFs und Bilder mit **LightOnOCR-3** über einen
 - 📄 **Durchsuchbares PDF im Original-Layout:** Die Seiten bleiben unverändert sichtbar, darüber liegt eine unsichtbare Textebene, zeilengenau an der richtigen Stelle.
 - 🖼️ **Bilderkennung:** Bilder, Logos und Diagramme werden ausgeschnitten und an ihrer Originalstelle eingefügt, mit Bildbeschreibung als Bildunterschrift.
 - 📝 **Export** als Markdown, Word (`.docx`) und LibreOffice (`.odt`), mit echten Tabellen und Formeln
+- 📂 **Eingabe- und Ausgabe-Ordner:** Alles verarbeiten, was im Eingabe-Ordner liegt, auf Wunsch laufend überwacht (Hotfolder). Erledigte Dateien werden übersprungen.
+- 🛟 **Robust:** Scheitert eine Seite, geht es mit der nächsten weiter. Bei Abbruch bleibt das bisher Erkannte erhalten.
 - 🖱️ **Grafische Oberfläche** für die Verarbeitung mehrerer Dateien, dazu eine Kommandozeile für Skripte
 
 ![Grafische Oberfläche](docs/gui.png)
@@ -56,23 +58,30 @@ pip install -r requirements.txt
 
 Doppelklick auf **`ocr_gui.pyw`** (oder `pythonw ocr_gui.pyw`). `ocr.py` muss im selben Ordner liegen.
 
-1. Das Programm verbindet sich mit Lemonade und wählt automatisch ein OCR-Modell.
+1. Das Programm verbindet sich mit Lemonade und wählt automatisch ein OCR-Modell. Läuft der Server noch nicht, kannst du den Modellnamen auch eintippen.
 2. Dateien hinzufügen. Du kannst sie auch direkt auf das Programmsymbol ziehen.
-3. Ausgabeformate ankreuzen und **Start** klicken.
+3. Oder einen **Eingabe-Ordner** ankreuzen: Dann werden alle PDFs und Bilder darin verarbeitet. Schon erledigte Dateien überspringt das Programm (außer mit „Bereits erledigte erneut verarbeiten“).
+4. Mit **Ordner überwachen** prüft das Programm alle 10 Sekunden, ob neue Dateien dazugekommen sind, und verarbeitet sie, sobald sie fertig kopiert sind. **Abbrechen** beendet die Überwachung.
+5. Optional einen **Ausgabe-Ordner** wählen, sonst landen die Ergebnisse neben der Originaldatei.
+6. Ausgabeformate ankreuzen und **Start** klicken.
 
 Die Einstellungen werden in `~/.ocr-gui.json` gespeichert, der API-Key bewusst nicht.
 
 ### Kommandozeile
 
 ```powershell
-python ocr.py <Modell> <Datei> [Prompt] [--pdf] [--docx] [--odt]
+python ocr.py <Modell> [Datei ...] [-e EINGABE] [-o AUSGABE] [--ueberwachen] [-p PROMPT] [--pdf] [--docx] [--odt]
 ```
 
 ```powershell
 python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 scan.jpg
 python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 dokument.pdf --pdf --docx
-python ocr.py user.PaddleOCR-VL-1.6-GGUF scan.png "OCR:"
+python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 a.pdf b.pdf -o Ergebnisse --pdf
+python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 -e Eingang -o Ergebnisse --pdf --ueberwachen
+python ocr.py user.PaddleOCR-VL-1.6-GGUF scan.png -p "OCR:"
 ```
+
+`python ocr.py --help` zeigt alle Optionen. Die alte Schreibweise mit dem Prompt als drittem Argument (`scan.png "OCR:"`) funktioniert weiterhin.
 
 Den Modellnamen zeigt `lemonade list`. Kommt die Meldung „model not found“, lass das Präfix `user.` weg.
 
@@ -83,13 +92,24 @@ Den Modellnamen zeigt `lemonade list`. Kommt die Meldung „model not found“, 
 | `--pdf` | `name.ocr.pdf`: durchsuchbares PDF im Original-Layout |
 | `--docx` | `name.ocr.docx`: Word-Datei (braucht Pandoc) |
 | `--odt` | `name.ocr.odt`: LibreOffice-Datei (braucht Pandoc) |
-| Prompt | Ohne Angabe gilt der `grounding`-Modus von LightOnOCR-3 mit Positionen und Bildern. Für PaddleOCR-VL: `"OCR:"` oder `"Table Recognition:"` |
+| `-p PROMPT` | Ohne Angabe gilt der `grounding`-Modus von LightOnOCR-3 mit Positionen und Bildern. `""` liefert nur Text. Für PaddleOCR-VL: `"OCR:"` oder `"Table Recognition:"` |
+| `-e ORDNER` | Eingabe-Ordner: alle PDFs und Bilder darin verarbeiten (ohne Unterordner). Bereits erledigte Dateien werden übersprungen |
+| `-o ORDNER` | Ausgabe-Ordner. Ohne Angabe landen die Ergebnisse neben der Originaldatei |
+| `--ueberwachen` | Eingabe-Ordner laufend auf neue Dateien prüfen, beenden mit Strg+C. Prüfabstand mit `--intervall SEK` (Standard 10) |
+| `--alle` | Im Eingabe-Ordner auch bereits erledigte Dateien neu verarbeiten |
+| `--url URL` | Server-Adresse, falls nicht `http://localhost:13305/api/v1` |
+
+**Gleiche Dateinamen:** Kommen in einem Durchlauf zwei Dateien mit demselben Namen vor (z. B. `Beispiel.pdf` und `Beispiel.png`), bekommt die zweite die Endung bzw. eine Nummer angehängt: `Beispiel-png.ocr.md`, `Beispiel-2.ocr.md`.
+
+**Als erledigt** gilt eine Datei, wenn im Ausgabe-Ordner schon ein vollständiges `name.ocr.md` liegt, das neuer ist als die Datei. Teilergebnisse werden beim nächsten Lauf neu verarbeitet.
+
+Der Rückgabewert ist 0, wenn alles geklappt hat, 1 bei Fehlern und 130 nach Strg+C.
 
 ### Konfiguration
 
 | Was | Wo |
 |---|---|
-| Server-Adresse | `BASE_URL` in `ocr.py` (Standard `http://localhost:13305/api/v1`) bzw. in der Oberfläche |
+| Server-Adresse | Umgebungsvariable `LEMONADE_BASE_URL`, Option `--url` bzw. in der Oberfläche (Standard `http://localhost:13305/api/v1`) |
 | API-Key | Umgebungsvariable `LEMONADE_API_KEY` bzw. in der Oberfläche |
 | Auflösung für das Modell | `MAX_KANTE` in `ocr.py` (Standard 2048 px, wie von LightOn empfohlen) |
 | Auflösung der Bilder | `BILD_DPI` in `ocr.py` (Standard 300) |
@@ -100,7 +120,10 @@ Den Modellnamen zeigt `lemonade list`. Kommt die Meldung „model not found“, 
 2. LightOnOCR-3 antwortet im `grounding`-Modus mit Blöcken der Form `![typ](x0,y0,x1,y1)` und dem Inhalt. Die Koordinaten sind auf 0–1000 normiert.
 3. **Textebene:** In jeder Box sucht das Skript die tatsächlichen Textzeilen im Bild, über das Helligkeitsprofil. Jede Zeile wird als unsichtbarer Text (`render_mode=3`) auf genau ihre Breite und Höhe gelegt.
 4. **Bilder:** Boxen vom Typ `image` oder `chart` werden ausgeschnitten, gespeichert, im PDF als eigenes Bildobjekt an die Originalstelle gelegt und in Markdown/Word/LibreOffice eingefügt.
-5. **Office-Export:** Markdown → HTML → DOCX/ODT über Pandoc. Der Umweg über HTML erhält HTML-Tabellen, und mit `--mathml` werden LaTeX-Formeln zu bearbeitbaren Office-Formeln.
+5. **Fehler und Abbruch:** Jede Anfrage wird bei Zeitüberschreitung oder Serverfehler automatisch bis zu zweimal wiederholt. Scheitert eine Seite trotzdem, steht im Markdown an ihrer Stelle `[FEHLER: Seite nicht erkannt …]`, und es geht mit der nächsten Seite weiter. Bei Abbruch oder wenn der Server ganz wegfällt, werden die fertigen Seiten trotzdem gespeichert, markiert mit `[UNVOLLSTÄNDIG …]`.
+6. **PDFs mit vorhandenem Text** (digitale PDFs oder schon per OCR bearbeitet) bekommen keine zweite Textebene, sonst gäbe es doppelte Suchtreffer.
+7. **Gedrehte Seiten** (`/Rotate` im PDF) werden so erkannt, wie sie angezeigt werden. Textebene und Bilder werden passend zurückgedreht.
+8. **Office-Export:** Markdown → HTML → DOCX/ODT über Pandoc. Der Umweg über HTML erhält HTML-Tabellen, und mit `--mathml` werden LaTeX-Formeln zu bearbeitbaren Office-Formeln.
 
 ## Anbindung an Paperless-ngx (optional)
 
@@ -122,12 +145,27 @@ Details stehen in der [ausführlichen Anleitung](docs/Anleitung.docx).
 | `[WARNUNG: Ausgabe abgeschnitten]` | Kontextgröße erhöhen (16384 oder mehr) |
 | Bild wird ignoriert | Modell ohne MMProj geladen, neu herunterladen |
 | Bild abgeschnitten | in `ocr.py` den Wert `rand = 4` erhöhen |
+| `✖ Seite N nicht erkannt` | Zeitüberschreitung oder Serverfehler bei dieser Seite. Die übrigen Seiten sind gespeichert. Datei später erneut verarbeiten (im Eingabe-Ordner passiert das beim nächsten Start automatisch) |
+| `[UNVOLLSTÄNDIG: …]` im Ergebnis | Verarbeitung wurde abgebrochen oder die Verbindung ist abgerissen. Datei erneut verarbeiten |
+| „enthielten schon Text – dort wurde keine zweite Textebene eingefügt“ | Hinweis, kein Fehler: Die PDF-Seite war schon durchsuchbar |
+| `PDF ist passwortgeschützt` | PDF zuerst ohne Passwort speichern |
+| `Pandoc-Fehler: …` | Die Meldung kommt direkt von Pandoc, meist ist Pandoc zu alt oder die Zieldatei ist noch in Word geöffnet |
+| Datei im überwachten Ordner wird nicht verarbeitet | Sie wird erst genommen, wenn sie sich zwischen zwei Prüfungen nicht mehr ändert. Nach einem Fehler wird sie erst wieder versucht, wenn sie sich ändert oder das Programm neu startet |
 
 ## Grenzen
 
 - Word/LibreOffice enthalten Text, Überschriften, Listen, Tabellen und Bilder, aber nicht das exakte Seitenlayout. Das bleibt nur im PDF erhalten.
-- Gedrehte PDF-Seiten werden nicht gesondert behandelt.
 - Positionen und Bilder gibt es nur mit LightOnOCR-3. Mit anderen Modellen liegt der Text als ein Block über der Seite.
+
+## Tests
+
+Die Tests brauchen keinen Lemonade Server: Statt `ocr.ocr` liefert eine Fake-Funktion eine feste grounding-Antwort mit absichtlich ungenauen Boxen. Geprüft wird unter anderem, ob die Wörter im durchsuchbaren PDF an der richtigen Stelle liegen (auch bei gedrehten Seiten).
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+Der GUI-Test läuft nur mit Display. Unter Linux headless: `xvfb-run python -m unittest discover -s tests -v`.
 
 ## Lizenz
 

@@ -2,13 +2,15 @@
 OCR über einen lokalen Lemonade Server (OpenAI-kompatible API).
 
 Installation:   pip install openai pymupdf
-Aufruf:         python ocr.py <Modellname> <Bild-oder-PDF> [Prompt] [--pdf] [--docx] [--odt]
+Aufruf:         python ocr.py <Modell> [Datei ...] [Optionen]
 
 Beispiele:
   python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 scan.png
-  python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 arbeitsblatt.pdf --pdf
   python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 arbeitsblatt.pdf --pdf --docx
-  python ocr.py user.PaddleOCR-VL-1.6-GGUF scan.png "OCR:"
+  python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 a.pdf b.pdf -o Ergebnisse --pdf
+  python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 -e Eingang -o Ergebnisse --pdf
+  python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 -e Eingang -o Ergebnisse --pdf --ueberwachen
+  python ocr.py user.PaddleOCR-VL-1.6-GGUF scan.png -p "OCR:"
 
 Ohne Prompt nutzt das Skript den "grounding"-Modus von LightOnOCR-3: Das Modell
 liefert zu jedem Block die Position. Bilder und Diagramme werden ausgeschnitten,
@@ -24,8 +26,14 @@ Word und LibreOffice eingefügt. Für andere Modelle eigenen Prompt angeben.
 --docx / --odt   Zusätzlich Word- bzw. LibreOffice-Datei
                  (braucht Pandoc: winget install JohnMacFarlane.Pandoc)
 
+-e ORDNER        Eingabe-Ordner: alle PDFs und Bilder darin verarbeiten
+                 (bereits erledigte werden übersprungen, außer mit --alle)
+-o ORDNER        Ausgabe-Ordner (Standard: neben der Originaldatei)
+--ueberwachen    Eingabe-Ordner laufend auf neue Dateien prüfen (Strg+C beendet)
+
 Den genauen Modellnamen zeigt:  lemonade list
 """
+import argparse
 import base64
 import html
 import os
@@ -33,13 +41,20 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
+import openai
 import pymupdf as fitz  # pip-Paket "pymupdf"
 from openai import OpenAI
 
-BASE_URL = "http://localhost:13305/api/v1"  # Port prüfen mit: lemonade config
+# Port prüfen mit: lemonade config. Lässt sich über LEMONADE_BASE_URL ändern.
+BASE_URL = os.environ.get("LEMONADE_BASE_URL", "http://localhost:13305/api/v1")
 MAX_KANTE = 2048                             # längste Bildkante in Pixeln
+WIEDERHOLUNGEN = 2                           # automatische Wiederholungen je Anfrage
+
+# Dateitypen, die verarbeitet werden (Eingabe-Ordner, GUI-Dateiauswahl)
+ENDUNGEN = (".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp")
 
 client = None
 
@@ -50,7 +65,7 @@ def verbinden(base_url: str = BASE_URL, api_key: str | None = None):
     global client
     client = OpenAI(base_url=base_url,
                     api_key=api_key or os.environ.get("LEMONADE_API_KEY", "lemonade"),
-                    timeout=600)
+                    timeout=600, max_retries=WIEDERHOLUNGEN)
     return client
 
 
@@ -84,7 +99,10 @@ BILD_DPI = 300                               # Auflösung der ausgeschnittenen B
 def seiten_laden(pfad: Path) -> fitz.Document:
     """Öffnet PDF oder Bild als PDF-Dokument (ein Bild = eine Seite)."""
     if pfad.suffix.lower() == ".pdf":
-        return fitz.open(pfad)
+        doc = fitz.open(pfad)
+        if doc.needs_pass:
+            raise ValueError("PDF ist passwortgeschützt – bitte zuerst ohne Passwort speichern.")
+        return doc
     bild = fitz.open(pfad)
     return fitz.open("pdf", bild.convert_to_pdf())
 
@@ -92,6 +110,12 @@ def seiten_laden(pfad: Path) -> fitz.Document:
 def seite_als_png(seite: fitz.Page) -> bytes:
     zoom = MAX_KANTE / max(seite.rect.width, seite.rect.height)
     return seite.get_pixmap(matrix=fitz.Matrix(zoom, zoom)).tobytes("png")
+
+
+def hat_textebene(seite: fitz.Page) -> bool:
+    """True, wenn die Seite schon echten Text enthält (z. B. digitales PDF
+    oder bereits per OCR bearbeitet)."""
+    return bool(seite.get_text("text").strip())
 
 
 # -------------------------------------------------------------------- OCR ---
@@ -122,6 +146,19 @@ def ocr(modell: str, png: bytes, prompt: str) -> str:
     if antwort.choices[0].finish_reason == "length":
         text += "\n\n[WARNUNG: Ausgabe abgeschnitten – max_tokens/Kontext erhöhen]"
     return text
+
+
+def seitenfehler(fehler: Exception) -> bool:
+    """True, wenn der Fehler nur diese eine Seite betrifft (Zeitüberschreitung,
+    Serverfehler, zu große Anfrage). Dann lohnt es sich, mit der nächsten Seite
+    weiterzumachen. Bei fehlender Verbindung, falschem Key oder unbekanntem
+    Modell würden alle Seiten scheitern – dann wird die Datei abgebrochen."""
+    if isinstance(fehler, openai.APITimeoutError):
+        return True
+    if isinstance(fehler, (openai.APIConnectionError, openai.AuthenticationError,
+                           openai.PermissionDeniedError, openai.NotFoundError)):
+        return False
+    return isinstance(fehler, openai.APIStatusError)
 
 
 # ------------------------------------------------------- Grounding-Format ---
@@ -175,19 +212,30 @@ def als_markdown(bloecke, bilder=None) -> str:
     return "\n\n".join(teile)
 
 
+# Hervorhebung nur erkennen, wenn die Zeichen ein Wort umschließen: so bleiben
+# "datei_name_neu.txt" und "5 * 3 * 2" unverändert, "**fett**" wird zu "fett"
+_HERVORHEBUNG = re.compile(r"(?<![\w*`])(\*\*|__|\*|_|`)(?=\S)(.+?)(?<=\S)\1(?![\w*`])")
+
+
 def als_klartext(inhalt: str) -> str:
     """Markdown/HTML zu schlichtem Text für die unsichtbare Textebene."""
     t = re.sub(r"</t[dh]>", " ", inhalt)
     t = re.sub(r"</tr>|<br\s*/?>", "\n", t)
     t = re.sub(r"<[^>]+>", "", t)
     t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.M)      # Überschriften
-    t = re.sub(r"(\*\*|__|\*|_|`)(.+?)\1", r"\2", t)          # Fett, kursiv, Code
+    t = _HERVORHEBUNG.sub(r"\2", t)                           # Fett, kursiv, Code
     t = re.sub(r"^\s*\|?[-:| ]+\|?\s*$", "", t, flags=re.M)   # Markdown-Tabellenlinien
     t = t.replace("|", " ")
     return html.unescape(re.sub(r"[ \t]+", " ", t)).strip()
 
 
 # ----------------------------------------------------- Durchsuchbares PDF ---
+# Gedrehte Seiten (page.rotation): Das Modell sieht die Seite so, wie sie
+# angezeigt wird. seite.rect, get_pixmap() und clip arbeiten ebenfalls in
+# diesen Anzeige-Koordinaten. insert_text/insert_textbox/insert_image erwarten
+# dagegen ungedrehte Koordinaten: Deshalb werden Punkte und Rechtecke mit
+# seite.derotation_matrix umgerechnet und der Text mit rotate=seite.rotation
+# gesetzt.
 
 def _passt(rect: fitz.Rect, text: str, groesse: float) -> bool:
     probe = fitz.open()
@@ -204,7 +252,8 @@ def _block_einpassen(seite: fitz.Page, rect: fitz.Rect, text: str):
     for _ in range(12):
         mitte = (lo + hi) / 2
         lo, hi = (mitte, hi) if _passt(rect, text, mitte) else (lo, mitte)
-    seite.insert_textbox(rect, text, fontsize=lo, render_mode=3, **SCHRIFT)
+    seite.insert_textbox(rect * seite.derotation_matrix, text, fontsize=lo, render_mode=3,
+                         rotate=seite.rotation, **SCHRIFT)
 
 
 # Tabelle für bytes.translate: dunkles Pixel -> 1, helles -> 0
@@ -286,6 +335,8 @@ def textebene_einfuegen(seite: fitz.Page, bloecke):
     grau = seite.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY, alpha=False)
     sx, sy = seite.rect.width / grau.width, seite.rect.height / grau.height
     schrift = fitz.Font(fontfile=SCHRIFT_DATEI) if SCHRIFT_DATEI else fitz.Font("helv")
+    drehung = seite.rotation
+    ungedreht = seite.derotation_matrix
 
     for typ, (x0, y0, x1, y1), inhalt in bloecke:
         if typ in KEIN_SEITENTEXT:
@@ -314,17 +365,20 @@ def textebene_einfuegen(seite: fitz.Page, bloecke):
             if laenge <= 0:
                 continue
             # Grundlinie so legen, dass der Text vertikal mittig auf der Zeile sitzt
-            grundlinie = fitz.Point(r.x0, (r.y0 + r.y1) / 2 + groesse * 0.255)
+            grundlinie = fitz.Point(r.x0, (r.y0 + r.y1) / 2 + groesse * 0.255) * ungedreht
             # Text horizontal genau auf die Zeilenbreite strecken/stauchen
+            # (bei 90°/270° liegt die Leserichtung auf der ungedrehten y-Achse)
+            faktor = r.width / laenge
+            strecken = fitz.Matrix(1, faktor) if drehung in (90, 270) else fitz.Matrix(faktor, 1)
             seite.insert_text(grundlinie, zeile, fontsize=groesse, render_mode=3,
-                              morph=(grundlinie, fitz.Matrix(r.width / laenge, 1)), **SCHRIFT)
+                              rotate=drehung, morph=(grundlinie, strecken), **SCHRIFT)
 
 
 # ------------------------------------------------------- Bilder ausschneiden ---
 
 def bilder_ausschneiden(seite: fitz.Page, bloecke, ordner: Path, seitennr: int):
     """Schneidet Bilder und Diagramme an ihren Boxen aus der Seite aus.
-    Liefert {Blockindex: (Dateipfad, Rect, PNG-Bytes)}."""
+    Liefert {Blockindex: (Dateipfad, Rect, PNG-Bytes)}; Rect in Anzeige-Koordinaten."""
     ergebnis = {}
     W, H = seite.rect.width, seite.rect.height
     for i, (typ, (x0, y0, x1, y1), _) in enumerate(bloecke):
@@ -336,14 +390,30 @@ def bilder_ausschneiden(seite: fitz.Page, bloecke, ordner: Path, seitennr: int):
         if rect.is_empty or rect.width < 10 or rect.height < 10:
             continue
         png = seite.get_pixmap(dpi=BILD_DPI, clip=rect, alpha=False).tobytes("png")
-        ordner.mkdir(exist_ok=True)
+        ordner.mkdir(parents=True, exist_ok=True)
         datei = ordner / f"seite{seitennr:02d}-bild{len(ergebnis) + 1:02d}.png"
         datei.write_bytes(png)
         ergebnis[i] = (datei, rect, png)
     return ergebnis
 
 
+def bilder_einfuegen(seite: fitz.Page, bilder):
+    """Ausgeschnittene Bilder als eigene Objekte deckungsgleich auf die Seite legen."""
+    for _, rect, png in bilder.values():
+        seite.insert_image(rect * seite.derotation_matrix, stream=png, rotate=seite.rotation)
+
+
 # ----------------------------------------------------------- Office-Export ---
+
+def _pandoc(befehl, **kwargs) -> str:
+    """Pandoc ausführen; bei Fehlern Pandocs eigene Meldung weitergeben."""
+    try:
+        return subprocess.run(befehl, capture_output=True, text=True, encoding="utf-8",
+                              check=True, **kwargs).stdout
+    except subprocess.CalledProcessError as f:
+        meldung = (f.stderr or "").strip() or f"Rückgabewert {f.returncode}"
+        raise RuntimeError(f"Pandoc-Fehler: {meldung}") from None
+
 
 def office_export(md_datei: Path, formate, melden=_melden):
     """Markdown -> HTML -> DOCX/ODT über Pandoc.
@@ -353,63 +423,196 @@ def office_export(md_datei: Path, formate, melden=_melden):
     if not pandoc:
         melden("Pandoc nicht gefunden – installieren mit: winget install JohnMacFarlane.Pandoc")
         return []
-    html_text = subprocess.run(
-        [pandoc, "-f", "markdown", "-t", "html", "--mathml", str(md_datei)],
-        capture_output=True, text=True, encoding="utf-8", check=True,
-        cwd=md_datei.parent,
-    ).stdout
+    html_text = _pandoc([pandoc, "-f", "markdown", "-t", "html", "--mathml", str(md_datei)],
+                        cwd=md_datei.parent)
     erzeugt = []
     for fmt in formate:
         ziel = md_datei.with_suffix("." + fmt)   # scan.ocr.md -> scan.ocr.docx
-        subprocess.run([pandoc, "-f", "html", "-o", str(ziel.resolve()),
-                        "--resource-path", str(md_datei.parent.resolve())],
-                       input=html_text, text=True, encoding="utf-8", check=True,
-                       cwd=md_datei.parent)
+        _pandoc([pandoc, "-f", "html", "-o", str(ziel.resolve()),
+                 "--resource-path", str(md_datei.parent.resolve())],
+                input=html_text, cwd=md_datei.parent)
         melden(f"Gespeichert: {ziel}")
         erzeugt.append(ziel)
     return erzeugt
 
 
+# ------------------------------------------------- Ordner und Dateinamen ---
+
+def ausgabe_name(datei: Path, ordner: Path, belegt: set | None = None) -> str:
+    """Namensstamm der Ergebnisse (ohne ".ocr"). Normalerweise der Name der
+    Originaldatei. Ist er in diesem Durchlauf schon vergeben (z. B. Beispiel.pdf
+    und Beispiel.png oder zwei Beispiel.pdf aus verschiedenen Ordnern), wird die
+    Endung bzw. eine Nummer angehängt: Beispiel-png, Beispiel-2 …"""
+    datei = Path(datei)
+    kandidaten = [datei.stem, f"{datei.stem}-{datei.suffix.lstrip('.').lower()}"]
+    kandidaten += [f"{datei.stem}-{n}" for n in range(2, 1000)]
+    for name in kandidaten:
+        schluessel = str(Path(ordner).resolve() / name).lower()  # Windows: Groß/klein egal
+        if belegt is None or schluessel not in belegt:
+            if belegt is not None:
+                belegt.add(schluessel)
+            return name
+    raise RuntimeError(f"Kein freier Ausgabename für {datei.name}")
+
+
+def ist_ergebnis(pfad: Path) -> bool:
+    """True für Dateien, die dieses Programm selbst erzeugt (Beispiel.ocr.pdf).
+    Wichtig, wenn Eingabe- und Ausgabe-Ordner derselbe sind."""
+    return Path(pfad).stem.lower().endswith(".ocr")
+
+
+def ordner_dateien(eingabe: Path) -> list[Path]:
+    """Alle verarbeitbaren Dateien im Eingabe-Ordner (ohne Unterordner),
+    alphabetisch sortiert und ohne eigene Ergebnisse."""
+    return sorted((p for p in Path(eingabe).iterdir()
+                   if p.is_file() and p.suffix.lower() in ENDUNGEN and not ist_ergebnis(p)
+                   and not p.name.startswith((".", "~$"))),
+                  key=lambda p: p.name.lower())
+
+
+def ist_erledigt(datei: Path, ordner: Path, name: str) -> bool:
+    """True, wenn es schon ein vollständiges Markdown-Ergebnis gibt, das neuer
+    ist als die Datei. Teilergebnisse (Abbruch, fehlende Seiten) zählen nicht."""
+    md = Path(ordner) / f"{name}.ocr.md"
+    try:
+        if md.stat().st_mtime < Path(datei).stat().st_mtime:
+            return False
+        text = md.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return UNVOLLSTAENDIG not in text and SEITE_FEHLT not in text
+
+
+class Wartezimmer:
+    """Merkt sich beim Überwachen Größe und Änderungszeit jeder Datei. Eine Datei
+    gilt erst als bereit, wenn sie bei zwei Prüfungen gleich geblieben ist – so
+    wird keine Datei verarbeitet, die gerade noch kopiert oder gescannt wird."""
+
+    def __init__(self):
+        self.stand = {}
+
+    def bereit(self, datei: Path) -> bool:
+        try:
+            st = datei.stat()
+        except OSError:
+            return False
+        jetzt = (st.st_size, st.st_mtime)
+        vorher = self.stand.get(datei)
+        self.stand[datei] = jetzt
+        return vorher == jetzt and st.st_size > 0
+
+
+def offene_dateien(eingabe: Path, ausgabe: Path | None = None, alle: bool = False,
+                   wartezimmer: "Wartezimmer | None" = None) -> list[tuple[Path, str]]:
+    """Dateien im Eingabe-Ordner, die (noch) zu verarbeiten sind, als Liste
+    (Datei, Ausgabename). Bereits erledigte werden übersprungen, außer mit alle.
+    Mit wartezimmer nur Dateien, die sich seit der letzten Prüfung nicht mehr
+    verändert haben."""
+    belegt, ergebnis = set(), []
+    for d in ordner_dateien(eingabe):
+        ziel = Path(ausgabe) if ausgabe else d.parent
+        name = ausgabe_name(d, ziel, belegt)      # Namen immer gleich vergeben
+        if not alle and ist_erledigt(d, ziel, name):
+            continue
+        if wartezimmer is not None and not wartezimmer.bereit(d):
+            continue
+        ergebnis.append((d, name))
+    return ergebnis
+
+
 # ------------------------------------------------------------------- Main ---
+
+UNVOLLSTAENDIG = "[UNVOLLSTÄNDIG"   # Markierungen im Markdown, siehe ist_erledigt()
+SEITE_FEHLT = "[FEHLER: Seite nicht erkannt"
+
 
 class Abgebrochen(Exception):
     pass
 
 
+class SeitenFehler(Exception):
+    """Die Datei wurde gespeichert, aber einzelne Seiten konnten nicht erkannt
+    werden. erzeugt: geschriebene Dateien, seiten: Nummern der fehlenden Seiten."""
+
+    def __init__(self, erzeugt, seiten):
+        self.erzeugt, self.seiten = erzeugt, seiten
+        super().__init__("Seite(n) " + ", ".join(map(str, seiten)) + " nicht erkannt")
+
+
 def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool = False,
                 formate=(), ziel_ordner: Path | None = None, melden=_melden,
-                fortschritt=None, abbrechen=None) -> list[Path]:
+                fortschritt=None, abbrechen=None, belegt: set | None = None,
+                name: str | None = None) -> list[Path]:
     """Eine Datei komplett verarbeiten. Liefert die erzeugten Dateien.
-    fortschritt(seite, gesamt) und abbrechen() -> bool sind optional (für die GUI)."""
+    fortschritt(seite, gesamt) und abbrechen() -> bool sind optional (für die GUI).
+    belegt: Menge der in diesem Durchlauf schon vergebenen Ausgabenamen,
+    name: fester Ausgabename (z. B. aus offene_dateien()).
+
+    Scheitert eine einzelne Seite (z. B. Zeitüberschreitung), geht es mit der
+    nächsten weiter; am Ende kommt SeitenFehler. Bei Abbruch oder einem Fehler,
+    der alle Seiten beträfe, wird das bisher Erkannte trotzdem gespeichert."""
     datei = Path(datei)
     ordner = Path(ziel_ordner) if ziel_ordner else datei.parent
     ordner.mkdir(parents=True, exist_ok=True)
-    basis = str(ordner / (datei.stem + ".ocr"))   # + ".md", ".pdf" …
-    bild_ordner = ordner / (datei.stem + ".ocr-bilder")
+    name = name or ausgabe_name(datei, ordner, belegt)
+    basis = str(ordner / (name + ".ocr"))   # + ".md", ".pdf" …
+    bild_ordner = ordner / (name + ".ocr-bilder")
 
     doc = seiten_laden(datei)
-    teile, erzeugt = [], []
-    for nr, seite in enumerate(doc, start=1):
-        if abbrechen and abbrechen():
-            raise Abgebrochen()
-        melden(f"→ {datei.name}: Seite {nr}/{doc.page_count} …")
-        if fortschritt:
-            fortschritt(nr - 1, doc.page_count)
-        antwort = ocr(modell, seite_als_png(seite), prompt)
-        bloecke = bloecke_parsen(antwort)
-        bilder = bilder_ausschneiden(seite, bloecke, bild_ordner, nr)
-        links = {i: f"{bild_ordner.name}/{d.name}" for i, (d, _, _) in bilder.items()}
-        teile.append(f"## Seite {nr}\n\n{als_markdown(bloecke, links)}")
-        if pdf:
-            # Bilder als eigene Objekte deckungsgleich an die Originalstelle legen
-            for _, rect, png in bilder.values():
-                seite.insert_image(rect, stream=png)
-            textebene_einfuegen(seite, bloecke)
-        if bilder:
-            melden(f"   {len(bilder)} Bild(er) gespeichert in {bild_ordner}")
+    gesamt = doc.page_count
+    teile, fehlend, mit_text = [], [], []
+    fertig = 0
+    try:
+        for nr, seite in enumerate(doc, start=1):
+            if abbrechen and abbrechen():
+                raise Abgebrochen()
+            melden(f"→ {datei.name}: Seite {nr}/{gesamt} …")
+            if fortschritt:
+                fortschritt(nr - 1, gesamt)
+            try:
+                antwort = ocr(modell, seite_als_png(seite), prompt)
+            except Exception as f:
+                if not seitenfehler(f):
+                    raise
+                melden(f"   ✖ Seite {nr} nicht erkannt: {f}")
+                fehlend.append(nr)
+                teile.append(f"## Seite {nr}\n\n*{SEITE_FEHLT} – {type(f).__name__}]*")
+                fertig = nr
+                continue
+            bloecke = bloecke_parsen(antwort)
+            bilder = bilder_ausschneiden(seite, bloecke, bild_ordner, nr)
+            links = {i: f"{bild_ordner.name}/{d.name}" for i, (d, _, _) in bilder.items()}
+            teile.append(f"## Seite {nr}\n\n{als_markdown(bloecke, links)}")
+            if pdf:
+                # Bilder als eigene Objekte deckungsgleich an die Originalstelle legen
+                bilder_einfuegen(seite, bilder)
+                if hat_textebene(seite):
+                    mit_text.append(nr)   # sonst doppelte Suchtreffer
+                else:
+                    textebene_einfuegen(seite, bloecke)
+            if bilder:
+                melden(f"   {len(bilder)} Bild(er) gespeichert in {bild_ordner}")
+            fertig = nr
+    except (Exception, KeyboardInterrupt) as f:
+        if fertig:
+            grund = "abgebrochen" if isinstance(f, (Abgebrochen, KeyboardInterrupt)) else "Fehler"
+            teile.append(f"*{UNVOLLSTAENDIG}: {grund} nach Seite {fertig} von {gesamt}]*")
+            melden(f"   Teilergebnis wird gespeichert ({fertig} von {gesamt} Seiten) …")
+            _speichern(doc, teile, basis, pdf, (), melden)
+        raise
     if fortschritt:
-        fortschritt(doc.page_count, doc.page_count)
+        fortschritt(gesamt, gesamt)
+    if mit_text:
+        melden(f"   Hinweis: Seite(n) {', '.join(map(str, mit_text))} enthielten schon Text – "
+               "dort wurde keine zweite Textebene eingefügt.")
+    erzeugt = _speichern(doc, teile, basis, pdf, formate, melden)
+    if fehlend:
+        raise SeitenFehler(erzeugt, fehlend)
+    return erzeugt
 
+
+def _speichern(doc, teile, basis, pdf, formate, melden) -> list[Path]:
+    erzeugt = []
     md_ziel = Path(basis + ".md")
     md_ziel.write_text("\n\n".join(teile), encoding="utf-8")
     melden(f"Gespeichert: {md_ziel}")
@@ -428,20 +631,107 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
     return erzeugt
 
 
-def main():
-    args = sys.argv[1:]
-    schalter = {a for a in args if a in ("--pdf", "--docx", "--odt")}
-    args = [a for a in args if a not in schalter]
-    if len(args) < 2:
-        print(__doc__)
-        sys.exit(1)
-    modell, datei = args[0], Path(args[1])
-    # Standard: grounding-Modus von LightOnOCR-3 – liefert Positionen für
-    # Textebene und Bilder. Für andere Modelle eigenen Prompt angeben.
-    prompt = args[2] if len(args) > 2 else "grounding"
-    formate = [f for f in ("docx", "odt") if f"--{f}" in schalter]
-    erzeugt = verarbeiten(modell, datei, prompt, pdf="--pdf" in schalter, formate=formate)
-    print(erzeugt[0].read_text(encoding="utf-8"))
+# ---------------------------------------------------------- Kommandozeile ---
+
+def _argumente(argv):
+    p = argparse.ArgumentParser(
+        prog="ocr.py", description="OCR über einen lokalen Lemonade Server.",
+        epilog="Den genauen Modellnamen zeigt: lemonade list")
+    p.add_argument("modell", help="Modellname, z. B. user.LightOnOCR-3-4B-GGUF-Q8_0")
+    p.add_argument("dateien", nargs="*", metavar="DATEI", help="PDFs oder Bilder")
+    p.add_argument("-p", "--prompt", default=None,
+                   help='Prompt (Standard: "grounding"; "" = nur Text; PaddleOCR-VL: "OCR:")')
+    p.add_argument("-e", "--eingabe", metavar="ORDNER", type=Path,
+                   help="Eingabe-Ordner: alle PDFs und Bilder darin verarbeiten")
+    p.add_argument("-o", "--ausgabe", metavar="ORDNER", type=Path,
+                   help="Ausgabe-Ordner (Standard: neben der Originaldatei)")
+    p.add_argument("--ueberwachen", action="store_true",
+                   help="Eingabe-Ordner laufend auf neue Dateien prüfen (Strg+C beendet)")
+    p.add_argument("--intervall", type=float, default=10, metavar="SEK",
+                   help="Prüfabstand beim Überwachen in Sekunden (Standard 10)")
+    p.add_argument("--alle", action="store_true",
+                   help="Im Eingabe-Ordner auch bereits erledigte Dateien neu verarbeiten")
+    p.add_argument("--pdf", action="store_true", help="durchsuchbares PDF erzeugen")
+    p.add_argument("--docx", action="store_true", help="Word-Datei erzeugen (braucht Pandoc)")
+    p.add_argument("--odt", action="store_true", help="LibreOffice-Datei erzeugen (braucht Pandoc)")
+    p.add_argument("--url", default=BASE_URL, help=f"Server-Adresse (Standard {BASE_URL})")
+    a = p.parse_args(argv)
+
+    # Alte Schreibweise "ocr.py Modell Datei Prompt": letztes Argument ist der
+    # Prompt, wenn es keine Datei ist und auch nicht wie ein Dateiname aussieht
+    if a.prompt is None and len(a.dateien) >= 2:
+        letztes = a.dateien[-1]
+        if not letztes or (not Path(letztes).exists()
+                           and Path(letztes).suffix.lower() not in ENDUNGEN):
+            a.prompt = a.dateien.pop()
+    if a.prompt is None:
+        a.prompt = "grounding"
+    if not a.dateien and not a.eingabe:
+        p.error("Bitte eine Datei oder mit -e einen Eingabe-Ordner angeben.")
+    if a.ueberwachen and not a.eingabe:
+        p.error("--ueberwachen braucht einen Eingabe-Ordner (-e).")
+    if a.eingabe and not a.eingabe.is_dir():
+        p.error(f"Eingabe-Ordner nicht gefunden: {a.eingabe}")
+    fehlt = [d for d in a.dateien if not Path(d).is_file()]
+    if fehlt:
+        p.error("Datei nicht gefunden: " + ", ".join(fehlt))
+    return a
+
+
+def main(argv=None):
+    for strom in (sys.stdout, sys.stderr):   # Windows: Umleiten in Datei ohne UnicodeEncodeError
+        try:
+            strom.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    a = _argumente(sys.argv[1:] if argv is None else argv)
+    verbinden(a.url)
+    formate = [f for f in ("docx", "odt") if getattr(a, f)]
+    fehler, letztes = 0, None
+
+    def eine_datei(d: Path, **kwargs) -> bool:
+        nonlocal fehler, letztes
+        try:
+            letztes = verarbeiten(a.modell, d, a.prompt, pdf=a.pdf, formate=formate,
+                                  ziel_ordner=a.ausgabe, **kwargs)
+            return True
+        except SeitenFehler as f:
+            _melden(f"✖ {d.name}: {f}")
+        except Abgebrochen:
+            raise
+        except Exception as f:
+            _melden(f"✖ Fehler bei {d.name}: {f}")
+        fehler += 1
+        return False
+
+    try:
+        belegt = set()
+        for d in a.dateien:
+            eine_datei(Path(d), belegt=belegt)
+        if a.eingabe:
+            if a.ueberwachen:
+                _melden(f"Überwache {a.eingabe} – beenden mit Strg+C")
+            wartezimmer, fehlgeschlagen = None, {}   # Datei -> Änderungszeit beim Fehlschlag
+            while True:
+                for d, name in offene_dateien(a.eingabe, a.ausgabe, a.alle, wartezimmer):
+                    mtime = d.stat().st_mtime
+                    if fehlgeschlagen.get(d) == mtime:
+                        continue                     # nicht endlos wiederholen
+                    if not eine_datei(d, name=name):
+                        fehlgeschlagen[d] = mtime
+                if not a.ueberwachen:
+                    break
+                # Beim ersten Durchlauf alles Vorhandene, danach nur Neues, das
+                # sich nicht mehr verändert (fertig kopiert/gescannt)
+                a.alle, wartezimmer = False, wartezimmer or Wartezimmer()
+                time.sleep(a.intervall)
+    except KeyboardInterrupt:
+        _melden("⏹ Abgebrochen.")
+        sys.exit(130)
+
+    if len(a.dateien) == 1 and not a.eingabe and letztes:
+        print(letztes[0].read_text(encoding="utf-8"))
+    sys.exit(1 if fehler else 0)
 
 
 if __name__ == "__main__":

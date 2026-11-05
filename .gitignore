@@ -218,3 +218,25 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------- local-lemon-ocr
+# Datenschutz: keine Scans, Bilder oder OCR-Ergebnisse ins Repo.
+# Erlaubt sind nur Dateien in docs/.
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.bmp
+*.webp
+*.gif
+*.docx
+*.odt
+*.ocr.md
+*.ocr-bilder/
+Eingang/
+Ergebnisse/
+.ocr-gui.json
+!docs/
+!docs/**
