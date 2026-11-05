@@ -153,6 +153,36 @@ class GanzeSeiteAlsBildTest(Grundlage):
         ocr.verarbeiten("x", self.scan(), melden=STILL)
         self.assertEqual(aufrufe + aufrufe2, ["grounding", "grounding"])
 
+    def test_wiederholungsschleife_wird_erkannt(self):
+        schleife = '"\n' * 73
+        aufrufe = self.mit_antworten({"grounding": "![text](100,100,900,900)\n" + schleife,
+                                      "": "1917 Oktoberrevolution"})
+        erzeugt = ocr.verarbeiten("x", self.scan(), pdf=True, melden=STILL)
+        self.assertEqual(aufrufe, ["grounding", ""])
+        self.assertIn("1917 Oktoberrevolution", erzeugt[0].read_text(encoding="utf-8"))
+
+    def test_unbrauchbar_auch_im_zweiten_versuch(self):
+        schleife = '"\n' * 73
+        aufrufe = self.mit_antworten({"grounding": schleife, "": "- - - - - - - - - - - - -"})
+        erzeugt = ocr.verarbeiten("x", self.scan(), pdf=True, melden=STILL)
+        self.assertEqual(aufrufe, ["grounding", ""])
+        md = erzeugt[0].read_text(encoding="utf-8")
+        self.assertIn(ocr.UNBRAUCHBAR, md)
+        self.assertNotIn('"\n"', md)
+        self.assertEqual(fitz.open(erzeugt[1])[0].get_text().strip(), "")
+
+    def test_leere_seite_ohne_hinweis(self):
+        self.mit_antworten({"grounding": ""})
+        md = ocr.verarbeiten("x", self.scan(), melden=STILL)[0].read_text(encoding="utf-8")
+        self.assertNotIn("Kein Text erkannt", md)
+
+    def test_unbrauchbar(self):
+        for text in ('"\n' * 73, "....................", "ab\n" * 12, '" " " "\n" "'):
+            self.assertTrue(ocr.unbrauchbar(text), text)
+        for text in ("", "1", "Datum: 03.03.", "| 1 | 2 |\n|---|---|\n| 3 | 4 |",
+                     self.antwort, "Ja\nNein\n" * 3):
+            self.assertFalse(ocr.unbrauchbar(text), text)
+
     def test_anderer_prompt_ohne_zweiten_versuch(self):
         aufrufe = self.mit_antworten({"OCR:": self.BILD})
         ocr.verarbeiten("x", self.scan(), prompt="OCR:", melden=STILL)
