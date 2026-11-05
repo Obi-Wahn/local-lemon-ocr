@@ -161,8 +161,6 @@ Es gibt zwei Wege:
 - **Einfach:** Durchsuchbare PDFs mit `--pdf` erzeugen und in den Eingangsordner (consume) von Paperless legen. Mit `PAPERLESS_OCR_MODE: skip` übernimmt Paperless die vorhandene Textebene.
 - **Automatisch:** Über [paperless-gpt](https://github.com/icereed/paperless-gpt) mit `VISION_LLM_PROVIDER: openai` und `OPENAI_BASE_URL` auf den Lemonade-Server. Dafür muss Lemonade im Netzwerk erreichbar sein (`lemonade config set host=0.0.0.0`, API-Key setzen, Firewall nur für den Server öffnen).
 
-Details stehen in der [ausführlichen Anleitung](docs/Anleitung.docx).
-
 ## Fehlerbehebung
 
 | Problem | Lösung |
