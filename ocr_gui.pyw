@@ -500,7 +500,8 @@ class OcrGui(QWidget):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("OCR mit Lemonade")
-    app.setDesktopFileName("ocr-lemonade")      # Wayland: Fenster der App zuordnen
+    # Bewusst kein setDesktopFileName(): Ohne passende, installierte .desktop-Datei
+    # meldet das XDG-Portal unter KDE/GNOME sonst „App info not found“.
     fenster = OcrGui([a for a in sys.argv[1:] if Path(a).is_file()])
     fenster.show()
     sys.exit(app.exec())
