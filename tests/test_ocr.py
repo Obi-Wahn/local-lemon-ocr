@@ -12,6 +12,7 @@ import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import openai
@@ -47,7 +48,7 @@ class Grundlage(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="ocr-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        patcher = mock.patch.object(ocr, "ocr", lambda modell, png, prompt: self.antwort)
+        patcher = mock.patch.object(ocr, "ocr", lambda modell, png, prompt, empfangen=None: self.antwort)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -120,7 +121,7 @@ class SeitenfehlerTest(Grundlage):
     def test_einzelne_seite_scheitert(self):
         aufrufe = []
 
-        def ocr_mit_fehler(modell, png, prompt):
+        def ocr_mit_fehler(modell, png, prompt, empfangen=None):
             aufrufe.append(1)
             if len(aufrufe) == 2:
                 raise zeitueberschreitung()
@@ -139,7 +140,7 @@ class SeitenfehlerTest(Grundlage):
     def test_verbindung_weg_speichert_teilergebnis(self):
         aufrufe = []
 
-        def ocr_ohne_server(modell, png, prompt):
+        def ocr_ohne_server(modell, png, prompt, empfangen=None):
             aufrufe.append(1)
             if len(aufrufe) == 3:
                 raise keine_verbindung()
@@ -268,6 +269,109 @@ class KommandozeileTest(Grundlage):
         code, aus, _ = self.starten("m", str(self.scan()))
         self.assertEqual(code, 0)
         self.assertIn("Ärger", aus)
+
+
+def _stueck(content=None, reasoning=None, grund=None):
+    """Ein Stück einer gestreamten Antwort, wie es der openai-Client liefert."""
+    delta = SimpleNamespace(content=content, model_extra={"reasoning_content": reasoning} if reasoning else {})
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=grund)])
+
+
+class StreamingTest(unittest.TestCase):
+    def anfragen(self, stuecke):
+        client = mock.Mock()
+        client.chat.completions.create.return_value = iter(stuecke)
+        zaehler = []
+        with mock.patch.object(ocr, "client", client):
+            text = ocr.ocr("m", b"png", "grounding", empfangen=zaehler.append)
+        return text, zaehler, client.chat.completions.create.call_args.kwargs
+
+    def test_text_wird_zusammengesetzt_und_gezaehlt(self):
+        text, zaehler, argumente = self.anfragen(
+            [_stueck("Hallo "), _stueck("Welt"), _stueck(grund="stop")])
+        self.assertEqual(text, "Hallo Welt")
+        self.assertEqual(zaehler[:2], [6, 10])
+        self.assertTrue(argumente["stream"])
+        # Denkmodus bleibt abgeschaltet (siehe CLAUDE.md)
+        self.assertEqual(argumente["extra_body"], {"chat_template_kwargs": {"enable_thinking": False}})
+
+    def test_rueckfall_auf_reasoning_und_warnung(self):
+        text, zaehler, _ = self.anfragen([_stueck(reasoning="Nur gedacht"), _stueck(grund="length")])
+        self.assertTrue(text.startswith("Nur gedacht"))
+        self.assertIn("WARNUNG: Ausgabe abgeschnitten", text)
+        self.assertEqual(zaehler[0], 11)
+
+
+class FortschrittTest(Grundlage):
+    def test_dauer_text(self):
+        self.assertEqual(ocr.dauer_text(5), "0:05")
+        self.assertEqual(ocr.dauer_text(125), "2:05")
+        self.assertEqual(ocr.dauer_text(3725), "1:02:05")
+
+    def test_restzeit_aus_bisherigen_seiten(self):
+        f = ocr.Fortschritt()
+        uhr = [100.0]
+        with mock.patch.object(ocr.time, "monotonic", lambda: uhr[0]):
+            f.seite_beginnt("Beispiel.pdf", 1, 3)
+            self.assertIsNone(f.stand()["rest"])          # noch keine Erfahrung
+            self.assertIn("Bild wird ausgewertet", f.text())
+            f.empfangen(500)
+            self.assertIn("500 Zeichen", f.text())
+            uhr[0] = 160.0
+            self.assertEqual(f.seite_fertig(), 60.0)
+            f.seite_beginnt("Beispiel.pdf", 2, 3)
+            uhr[0] = 190.0
+            st = f.stand()
+        self.assertAlmostEqual(st["anteil"], 1.5 / 3)    # halbe zweite Seite
+        self.assertAlmostEqual(st["rest"], 30 + 60)      # Rest Seite 2 + Seite 3
+        self.assertEqual(ocr.dauer_text(st["rest"]), "1:30")
+
+    def test_verarbeiten_meldet_seitendauer_und_zeichen(self):
+        zaehler = []
+
+        def ocr_mit_strom(modell, png, prompt, empfangen=None):
+            for n in (100, 200):
+                empfangen(n)
+                zaehler.append(anzeige.stand()["zeichen"])
+            return self.antwort
+
+        anzeige = ocr.Fortschritt()
+        meldungen = []
+        with mock.patch.object(ocr, "ocr", ocr_mit_strom):
+            ocr.verarbeiten("x", self.scan(seiten=2), melden=meldungen.append, anzeige=anzeige)
+        self.assertEqual(zaehler, [100, 200, 100, 200])
+        self.assertFalse(anzeige.aktiv)
+        self.assertEqual(len(anzeige.dauern), 2)
+        fertig = [m for m in meldungen if "fertig nach" in m]
+        self.assertEqual(len(fertig), 2)
+        self.assertIn("noch ca.", fertig[0])
+
+    def test_konsolenanzeige(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        strom = Terminal()
+        f = ocr.Fortschritt()
+        breit = mock.patch.object(ocr.shutil, "get_terminal_size", lambda *_: os.terminal_size((200, 20)))
+        with breit:
+            konsole = ocr.Konsolenanzeige(f, strom=strom, takt=0.01)
+            f.seite_beginnt("Beispiel.pdf", 1, 2)
+            time.sleep(0.1)
+            konsole.melden("→ Beispiel.pdf: Seite 1/2 …")
+            f.ende()
+            konsole.beenden()
+        ausgabe = strom.getvalue()
+        self.assertIn("Beispiel.pdf: Seite 1/2 · 0:00 · Bild wird ausgewertet", ausgabe)
+        self.assertIn("[----------", ausgabe)
+        self.assertIn("→ Beispiel.pdf: Seite 1/2 …\n", ausgabe)
+
+    def test_keine_konsolenanzeige_ohne_terminal(self):
+        strom = io.StringIO()
+        konsole = ocr.Konsolenanzeige(ocr.Fortschritt(), strom=strom, takt=0.01)
+        konsole.melden("Hallo")
+        konsole.beenden()
+        self.assertEqual(strom.getvalue(), "Hallo\n")
 
 
 @unittest.skipUnless(shutil.which("pandoc"), "Pandoc nicht installiert")

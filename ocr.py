@@ -41,6 +41,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -120,14 +121,17 @@ def hat_textebene(seite: fitz.Page) -> bool:
 
 # -------------------------------------------------------------------- OCR ---
 
-def ocr(modell: str, png: bytes, prompt: str) -> str:
+def ocr(modell: str, png: bytes, prompt: str, empfangen=None) -> str:
+    """Schickt ein Seitenbild an Lemonade und liefert den erkannten Text.
+    empfangen(zeichen) wird, falls angegeben, laufend mit der Zahl der bisher
+    empfangenen Zeichen aufgerufen. Dafür wird die Antwort gestreamt."""
     if client is None:
         verbinden()
     data_url = "data:image/png;base64," + base64.b64encode(png).decode()
     inhalt = [{"type": "image_url", "image_url": {"url": data_url}}]
     if prompt:
         inhalt.append({"type": "text", "text": prompt})
-    antwort = client.chat.completions.create(
+    anfrage = dict(
         model=modell,
         messages=[{"role": "user", "content": inhalt}],
         temperature=0.2,          # Empfehlung von LightOn
@@ -137,15 +141,121 @@ def ocr(modell: str, png: bytes, prompt: str) -> str:
         # in reasoning_content und content bleibt leer
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
-    msg = antwort.choices[0].message
-    text = msg.content or ""
+    if empfangen is None:
+        antwort = client.chat.completions.create(**anfrage)
+        msg = antwort.choices[0].message
+        return _antwort_text(msg.content, _reasoning(msg), antwort.choices[0].finish_reason)
+
+    text, denken, grund, zeichen = [], [], None, 0
+    for stueck in client.chat.completions.create(**anfrage, stream=True):
+        if not stueck.choices:
+            continue
+        wahl = stueck.choices[0]
+        if wahl.delta is not None:
+            for ziel, teil in ((text, wahl.delta.content), (denken, _reasoning(wahl.delta))):
+                if teil:
+                    ziel.append(teil)
+                    zeichen += len(teil)
+            empfangen(zeichen)
+        grund = wahl.finish_reason or grund
+    return _antwort_text("".join(text), "".join(denken), grund)
+
+
+def _reasoning(msg) -> str:
+    return getattr(msg, "reasoning_content", None) \
+        or (getattr(msg, "model_extra", None) or {}).get("reasoning_content", "") or ""
+
+
+def _antwort_text(text, reasoning, grund) -> str:
+    text = text or ""
     if not text.strip():
         # Fallback: Text steckt trotzdem im Reasoning-Feld
-        text = getattr(msg, "reasoning_content", None) \
-            or (msg.model_extra or {}).get("reasoning_content", "") or ""
-    if antwort.choices[0].finish_reason == "length":
+        text = reasoning or ""
+    if grund == "length":
         text += "\n\n[WARNUNG: Ausgabe abgeschnitten – max_tokens/Kontext erhöhen]"
     return text
+
+
+# ------------------------------------------------------ Fortschritt/Zeit ---
+
+def dauer_text(sekunden: float) -> str:
+    """125 -> "2:05", 3725 -> "1:02:05"."""
+    sekunden = max(0, int(round(sekunden)))
+    std, rest = divmod(sekunden, 3600)
+    return f"{std}:{rest // 60:02d}:{rest % 60:02d}" if std else f"{rest // 60}:{rest % 60:02d}"
+
+
+class Fortschritt:
+    """Stand der gerade laufenden Seite – für die Live-Anzeige in GUI und
+    Kommandozeile. verarbeiten() meldet Seitenbeginn, empfangene Zeichen und
+    Seitenende; die Anzeige fragt stand() bzw. text() so oft ab, wie sie will
+    (auch während das Modell noch das Bild auswertet und nichts schickt).
+
+    Die Restzeit wird aus der mittleren Dauer der letzten fertigen Seiten
+    geschätzt, auch über Dateien hinweg. Vor der ersten Seite gibt es keine
+    Schätzung."""
+
+    MERKEN = 10                      # so viele Seiten fließen in den Mittelwert ein
+
+    def __init__(self):
+        self.dauern, self.laengen = [], []
+        self.aktiv, self.nachbereitung = False, False
+        self.datei, self.seite, self.seiten, self.zeichen, self.start = "", 0, 0, 0, 0.0
+
+    def seite_beginnt(self, datei: str, seite: int, seiten: int):
+        self.datei, self.seite, self.seiten = datei, seite, seiten
+        self.zeichen, self.start, self.aktiv = 0, time.monotonic(), True
+        self.nachbereitung = False
+
+    def empfangen(self, zeichen: int):
+        self.zeichen = zeichen
+
+    def seite_fertig(self, erfolgreich: bool = True) -> float:
+        dauer = time.monotonic() - self.start
+        self.nachbereitung = True     # Antwort da, jetzt Textebene/Bilder/Speichern
+        if erfolgreich:
+            self.dauern = (self.dauern + [dauer])[-self.MERKEN:]
+            self.laengen = (self.laengen + [self.zeichen])[-self.MERKEN:]
+        return dauer
+
+    def ende(self):
+        self.aktiv = False
+
+    def mittlere_dauer(self):
+        return sum(self.dauern) / len(self.dauern) if self.dauern else None
+
+    def stand(self) -> dict:
+        """sekunden: Laufzeit der Seite, anteil: Fortschritt in der Datei (0–1),
+        rest: geschätzte Restzeit der Datei in Sekunden oder None."""
+        sekunden = time.monotonic() - self.start if self.aktiv else 0.0
+        mittel = self.mittlere_dauer()
+        if self.nachbereitung:
+            seite_anteil = 1.0
+            rest = mittel * (self.seiten - self.seite) if mittel else None
+        elif mittel:
+            seite_anteil = min(0.95, sekunden / mittel)
+            rest = max(0.0, mittel - sekunden) + mittel * (self.seiten - self.seite)
+        else:
+            erwartet = sum(self.laengen) / len(self.laengen) if self.laengen else 2500
+            seite_anteil = min(0.9, self.zeichen / erwartet)
+            rest = None
+        anteil = (self.seite - 1 + seite_anteil) / max(self.seiten, 1)
+        return dict(datei=self.datei, seite=self.seite, seiten=self.seiten, zeichen=self.zeichen,
+                    sekunden=sekunden, anteil=anteil, rest=rest)
+
+    def text(self) -> str:
+        """z. B. "Seite 2/5 · 1:23 · Text kommt an (340 Zeichen) · noch ca. 4:10"."""
+        st = self.stand()
+        if self.nachbereitung:
+            phase = "wird weiterverarbeitet"
+        elif st["zeichen"]:
+            phase = f"Text kommt an ({st['zeichen']} Zeichen)"
+        else:
+            phase = "Bild wird ausgewertet"
+        teile = [f"Seite {st['seite']}/{st['seiten']}", dauer_text(st["sekunden"]), phase]
+        if st["rest"] is not None and not (self.nachbereitung and self.seite == self.seiten):
+            teile.append(f"noch ca. {dauer_text(st['rest'])}" if st["rest"] >= 5 else "gleich fertig")
+        return " · ".join(teile)
 
 
 def seitenfehler(fehler: Exception) -> bool:
@@ -542,11 +652,12 @@ class SeitenFehler(Exception):
 def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool = False,
                 formate=(), ziel_ordner: Path | None = None, melden=_melden,
                 fortschritt=None, abbrechen=None, belegt: set | None = None,
-                name: str | None = None) -> list[Path]:
+                name: str | None = None, anzeige: Fortschritt | None = None) -> list[Path]:
     """Eine Datei komplett verarbeiten. Liefert die erzeugten Dateien.
     fortschritt(seite, gesamt) und abbrechen() -> bool sind optional (für die GUI).
     belegt: Menge der in diesem Durchlauf schon vergebenen Ausgabenamen,
-    name: fester Ausgabename (z. B. aus offene_dateien()).
+    name: fester Ausgabename (z. B. aus offene_dateien()),
+    anzeige: Fortschritt-Objekt für eine Live-Anzeige (Laufzeit, Zeichen, Restzeit).
 
     Scheitert eine einzelne Seite (z. B. Zeitüberschreitung), geht es mit der
     nächsten weiter; am Ende kommt SeitenFehler. Bei Abbruch oder einem Fehler,
@@ -562,6 +673,7 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
     gesamt = doc.page_count
     teile, fehlend, mit_text = [], [], []
     fertig = 0
+    anzeige = anzeige or Fortschritt()
     try:
         for nr, seite in enumerate(doc, start=1):
             if abbrechen and abbrechen():
@@ -569,9 +681,11 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
             melden(f"→ {datei.name}: Seite {nr}/{gesamt} …")
             if fortschritt:
                 fortschritt(nr - 1, gesamt)
+            anzeige.seite_beginnt(datei.name, nr, gesamt)
             try:
-                antwort = ocr(modell, seite_als_png(seite), prompt)
+                antwort = ocr(modell, seite_als_png(seite), prompt, empfangen=anzeige.empfangen)
             except Exception as f:
+                anzeige.seite_fertig(erfolgreich=False)
                 if not seitenfehler(f):
                     raise
                 melden(f"   ✖ Seite {nr} nicht erkannt: {f}")
@@ -579,6 +693,10 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
                 teile.append(f"## Seite {nr}\n\n*{SEITE_FEHLT} – {type(f).__name__}]*")
                 fertig = nr
                 continue
+            dauer = anzeige.seite_fertig()
+            rest = anzeige.mittlere_dauer() * (gesamt - nr)
+            melden(f"   fertig nach {dauer_text(dauer)} ({len(antwort)} Zeichen)"
+                   + (f", noch ca. {dauer_text(rest)} für diese Datei" if nr < gesamt else ""))
             bloecke = bloecke_parsen(antwort)
             bilder = bilder_ausschneiden(seite, bloecke, bild_ordner, nr)
             links = {i: f"{bild_ordner.name}/{d.name}" for i, (d, _, _) in bilder.items()}
@@ -594,12 +712,14 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
                 melden(f"   {len(bilder)} Bild(er) gespeichert in {bild_ordner}")
             fertig = nr
     except (Exception, KeyboardInterrupt) as f:
+        anzeige.ende()
         if fertig:
             grund = "abgebrochen" if isinstance(f, (Abgebrochen, KeyboardInterrupt)) else "Fehler"
             teile.append(f"*{UNVOLLSTAENDIG}: {grund} nach Seite {fertig} von {gesamt}]*")
             melden(f"   Teilergebnis wird gespeichert ({fertig} von {gesamt} Seiten) …")
             _speichern(doc, teile, basis, pdf, (), melden)
         raise
+    anzeige.ende()
     if fortschritt:
         fortschritt(gesamt, gesamt)
     if mit_text:
@@ -632,6 +752,68 @@ def _speichern(doc, teile, basis, pdf, formate, melden) -> list[Path]:
 
 
 # ---------------------------------------------------------- Kommandozeile ---
+
+class Konsolenanzeige:
+    """Live-Fortschrittszeile auf stderr, z. B.
+    [########------------]  40 % Beispiel.pdf: Seite 2/5 · 1:23 · Bild wird ausgewertet · noch ca. 4:10
+    Sie wird jede Sekunde neu gezeichnet, auch wenn das Modell gerade nichts
+    schickt. Nur im Terminal aktiv; beim Umleiten in eine Datei bleiben nur die
+    normalen Meldungen übrig."""
+
+    BREITE = 20
+
+    def __init__(self, fortschritt: Fortschritt, strom=None, takt: float = 1.0):
+        self.fortschritt, self.strom, self.takt = fortschritt, strom or sys.stderr, takt
+        self.sperre, self.stopp, self.sichtbar = threading.Lock(), threading.Event(), False
+        try:
+            self.aktiv = self.strom.isatty()
+        except (AttributeError, ValueError):
+            self.aktiv = False
+        if self.aktiv:
+            threading.Thread(target=self._laufen, daemon=True).start()
+
+    def zeile(self) -> str:
+        st = self.fortschritt.stand()
+        voll = int(st["anteil"] * self.BREITE)
+        return (f"[{'#' * voll}{'-' * (self.BREITE - voll)}] {st['anteil'] * 100:3.0f} % "
+                f"{st['datei']}: {self.fortschritt.text()}")
+
+    def _loeschen(self):
+        if self.sichtbar:
+            # Leerzeichen statt Escape-Sequenzen: funktioniert auch in alten Windows-Konsolen
+            self.strom.write("\r" + " " * (shutil.get_terminal_size((80, 20)).columns - 1) + "\r")
+            self.sichtbar = False
+
+    def _zeichnen(self):
+        if not self.fortschritt.aktiv:
+            self._loeschen()
+            return
+        breite = shutil.get_terminal_size((80, 20)).columns - 1
+        self.strom.write("\r" + self.zeile()[:breite].ljust(breite))
+        self.strom.flush()
+        self.sichtbar = True
+
+    def _laufen(self):
+        while not self.stopp.wait(self.takt):
+            with self.sperre:
+                self._zeichnen()
+
+    def melden(self, text: str):
+        """Normale Meldung ausgeben, ohne die Fortschrittszeile zu zerreißen."""
+        with self.sperre:
+            if self.aktiv:
+                self._loeschen()
+            print(text, file=self.strom, flush=True)
+            if self.aktiv:
+                self._zeichnen()
+
+    def beenden(self):
+        self.stopp.set()
+        with self.sperre:
+            if self.aktiv:
+                self._loeschen()
+                self.strom.flush()
+
 
 def _argumente(argv):
     p = argparse.ArgumentParser(
@@ -688,19 +870,23 @@ def main(argv=None):
     verbinden(a.url)
     formate = [f for f in ("docx", "odt") if getattr(a, f)]
     fehler, letztes = 0, None
+    fortschritt = Fortschritt()
+    konsole = Konsolenanzeige(fortschritt)
+    melden = konsole.melden
 
     def eine_datei(d: Path, **kwargs) -> bool:
         nonlocal fehler, letztes
         try:
             letztes = verarbeiten(a.modell, d, a.prompt, pdf=a.pdf, formate=formate,
-                                  ziel_ordner=a.ausgabe, **kwargs)
+                                  ziel_ordner=a.ausgabe, melden=melden, anzeige=fortschritt,
+                                  **kwargs)
             return True
         except SeitenFehler as f:
-            _melden(f"✖ {d.name}: {f}")
+            melden(f"✖ {d.name}: {f}")
         except Abgebrochen:
             raise
         except Exception as f:
-            _melden(f"✖ Fehler bei {d.name}: {f}")
+            melden(f"✖ Fehler bei {d.name}: {f}")
         fehler += 1
         return False
 
@@ -710,7 +896,7 @@ def main(argv=None):
             eine_datei(Path(d), belegt=belegt)
         if a.eingabe:
             if a.ueberwachen:
-                _melden(f"Überwache {a.eingabe} – beenden mit Strg+C")
+                melden(f"Überwache {a.eingabe} – beenden mit Strg+C")
             wartezimmer, fehlgeschlagen = None, {}   # Datei -> Änderungszeit beim Fehlschlag
             while True:
                 for d, name in offene_dateien(a.eingabe, a.ausgabe, a.alle, wartezimmer):
@@ -726,8 +912,10 @@ def main(argv=None):
                 a.alle, wartezimmer = False, wartezimmer or Wartezimmer()
                 time.sleep(a.intervall)
     except KeyboardInterrupt:
+        konsole.beenden()
         _melden("⏹ Abgebrochen.")
         sys.exit(130)
+    konsole.beenden()
 
     if len(a.dateien) == 1 and not a.eingabe and letztes:
         print(letztes[0].read_text(encoding="utf-8"))

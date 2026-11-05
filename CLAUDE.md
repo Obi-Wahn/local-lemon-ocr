@@ -6,11 +6,11 @@ Sprache im Projekt: **Deutsch** (Code-Kommentare, Ausgaben, Doku).
 Lokale OCR für PDFs und Bilder über einen **Lemonade Server** (AMD, OpenAI-kompatible API, llama.cpp-Backend) mit dem Vision-Modell **LightOnOCR-3** (GGUF, z. B. `prithivMLmods/LightOnOCR-3-4B-GGUF`, Q8_0 + mmproj).
 
 - `ocr.py`: Kernlogik und Kommandozeile mit `argparse` (`python ocr.py <Modell> [Datei ...] [-e EINGABE] [-o AUSGABE] [--ueberwachen] [-p PROMPT] [--pdf] [--docx] [--odt]`). Die alte Form mit dem Prompt als drittem Positionsargument bleibt erlaubt, wenn es keine Datei ist und nicht wie ein Dateiname aussieht.
-- `ocr_gui.pyw`: Tkinter-Oberfläche, importiert `ocr.py` aus demselben Ordner und nutzt `ocr.verbinden()`, `ocr.modelle_auflisten()`, `ocr.verarbeiten()`, `ocr.offene_dateien()` und `ocr.Wartezimmer`
+- `ocr_gui.pyw`: Qt-Oberfläche (PySide6, läuft unter Linux nativ auf Wayland), importiert `ocr.py` aus demselben Ordner und nutzt `ocr.verbinden()`, `ocr.modelle_auflisten()`, `ocr.verarbeiten()`, `ocr.offene_dateien()`, `ocr.Wartezimmer` und `ocr.Fortschritt`. Arbeit läuft in einem `threading.Thread`, Kommunikation über eine `queue.Queue`, die ein `QTimer` (100 ms) abholt; ein zweiter `QTimer` (500 ms) zeichnet die Live-Anzeige
 - `tests/`: `unittest`-Tests ohne Server (`testseite.py` = Testseite, Scan und Fake-grounding-Antwort; `test_ocr.py`; `test_gui.py` braucht Display)
-- `docs/Anleitung.docx`: ausführliche Anleitung für Endnutzer (Windows 11)
+- `docs/Anleitung.docx`: ausführliche Anleitung für Endnutzer (Windows 11). Enthält im Anhang den kompletten Quelltext von `ocr.py`, der bei Änderungen mitgezogen werden muss.
 
-Abhängigkeiten: `openai`, `pymupdf` (Import als `import pymupdf as fitz`), Python ≥ 3.10, optional Pandoc.
+Abhängigkeiten: `openai`, `pymupdf` (Import als `import pymupdf as fitz`), `PySide6` (nur für die GUI, von Tobias am 2026-11-05 freigegeben, ersetzt Tkinter), Python ≥ 3.10, optional Pandoc.
 
 ## Wichtige Erkenntnisse (nicht wieder rückgängig machen)
 - **Denkmodus:** LightOnOCR-3 basiert auf Qwen3.5. Ohne Gegenmaßnahme landet die Ausgabe in `reasoning_content`, und `content` bleibt leer. Deshalb wird bei jeder Anfrage `extra_body={"chat_template_kwargs": {"enable_thinking": False}}` gesendet und notfalls auf `reasoning_content` zurückgegriffen. Serverseitig empfehlen wir in Lemonade `--reasoning off` (bzw. `--reasoning-format none`) und Kontext 16384.
@@ -29,20 +29,21 @@ Abhängigkeiten: `openai`, `pymupdf` (Import als `import pymupdf as fitz`), Pyth
 - **Fehler pro Seite:** Der OpenAI-Client wiederholt selbst (`max_retries=2`). `seitenfehler()` entscheidet: Zeitüberschreitung und andere HTTP-Statusfehler betreffen nur die Seite, also weiter mit `[FEHLER: Seite nicht erkannt …]` im Markdown und am Ende `SeitenFehler`. Verbindungsfehler, 401/403/404 brechen die Datei ab. Bei Abbruch/Fehler (auch Strg+C) werden fertige Seiten mit `[UNVOLLSTÄNDIG …]` gespeichert. Beide Markierungen sorgen dafür, dass `ist_erledigt()` die Datei nicht als fertig ansieht.
 - **Eingabe-Ordner/Überwachung:** `offene_dateien()` liefert (Datei, Name) ohne Unterordner. Erledigt heißt: vollständiges `<name>.ocr.md` neuer als die Datei. Beim Überwachen wird eine neue Datei erst genommen, wenn `Wartezimmer` zweimal dieselbe Größe und Änderungszeit sieht. Fehlgeschlagene Dateien werden pro Sitzung nur erneut versucht, wenn sich ihre Änderungszeit ändert.
 - **Pandoc-Fehler:** `_pandoc()` gibt Pandocs stderr als `RuntimeError("Pandoc-Fehler: …")` weiter.
+- **Fortschritt:** `ocr()` streamt die Antwort (`stream=True`), wenn ein `empfangen`-Callback übergeben wird, und zählt Zeichen aus `content` und `reasoning_content`. Ohne Callback bleibt die alte, nicht gestreamte Anfrage. `Fortschritt` merkt sich Beginn, Zeichen und Dauer der letzten 10 Seiten; Restzeit = Mittelwert × verbleibende Seiten, vorher keine Schätzung. Phasen: „Bild wird ausgewertet“ (Prefill, noch keine Zeichen), „Text kommt an“, „wird weiterverarbeitet“. `Konsolenanzeige` zeichnet eine `\r`-Zeile auf stderr nur bei `isatty()`; sie löscht mit Leerzeichen statt ANSI-Codes (alte Windows-Konsolen). Fake-`ocr`-Funktionen in Tests müssen `empfangen=None` annehmen.
 - **Kommandozeile:** stdout/stderr werden auf UTF-8 umgestellt (Windows-Umleitung in Dateien). Rückgabewerte: 0 ok, 1 Fehler, 130 Strg+C.
 
 ## Testen ohne Lemonade
-Es gibt keinen echten Server in CI. Die Tests liegen in `tests/` und laufen mit `python -m unittest discover -s tests -v` (GUI-Test: `xvfb-run` davor). Getestet wird, indem man `ocr.ocr` durch eine Funktion ersetzt, die eine feste grounding-Antwort liefert:
+Es gibt keinen echten Server in CI. Die Tests liegen in `tests/` und laufen mit `python -m unittest discover -s tests -v` (GUI-Test mit Qt-Plattform `offscreen`, kein `xvfb-run` nötig). Getestet wird, indem man `ocr.ocr` durch eine Funktion ersetzt, die eine feste grounding-Antwort liefert:
 1. Testseite mit bekanntem Text erzeugen, als Bild rastern und als Bild-PDF speichern („Scan“).
 2. Absichtlich ungenaue Boxen in der Fake-Antwort verwenden.
 3. Wortpositionen im Ergebnis-PDF (`get_text("words")`) per IoU mit dem Original vergleichen. Aktueller Stand: ≈ 0,85 im Mittel (auch bei 90/180/270° gedrehten Seiten), waagerecht ±1–2 pt. Achtung: `get_text("words")` liefert ungedrehte Koordinaten, für den Vergleich mit `rotation_matrix` umrechnen.
-4. Die GUI headless testen: `xvfb-run` mit einem Python, das tkinter hat (z. B. `apt install python3-tk`, dann `/usr/bin/python3` statt eines eigenen Python ohne tkinter).
+4. Die GUI headless testen: `QT_QPA_PLATFORM=offscreen` (setzt `test_gui.py` selbst). Im Linux-Container braucht PySide6 dafür `libegl1`, `libgl1`, `libxkbcommon0`, `libfontconfig1`, `libdbus-1-3`. Modale Dialoge werden über `mock.patch.object(gui, "QMessageBox")` abgefangen. Screenshot für `docs/gui.png`: `fenster.grab().save(...)`.
 5. openai-Fehler für Tests ohne HTTP-Anfrage erzeugen (`klasse.__new__` + `Exception.__init__`), weil die Konstruktoren je nach openai-Version unterschiedliche `request`-Typen erwarten.
 
 ## Grenzen / mögliche nächste Schritte
 - Die Textebene ist zeilen-, nicht wortgenau.
+- Linux: Beim Lemonade-RPM ist der Server `lemond` (systemd-Dienst `lemond.service`), `lemonade` ist nur ein Client.
 - Der Eingabe-Ordner wird ohne Unterordner durchsucht. Verarbeitete Originale bleiben liegen (kein Verschieben).
-- `docs/Anleitung.docx` beschreibt die neuen Ordner-Optionen noch nicht.
 - Mögliche Erweiterungen: Paperless-Integration, englische Übersetzung von README und Oberfläche.
 
 ## Datenschutz
