@@ -299,6 +299,52 @@ def bloecke_parsen(text: str):
     return bloecke
 
 
+# Bildverweis ohne Koordinaten, z. B. "![image](image_1.png)". So antwortet
+# LightOnOCR, wenn es einen Bereich (oder die ganze Seite) für ein Bild hält,
+# aber nicht im grounding-Format. Die Datei gibt es nicht, der Link wäre kaputt.
+BILDVERWEIS = re.compile(r"!\[[^\]\n]*\]\((?!\s*\d+(?:\.\d+)?\s*,)[^)\n]*\)")
+KEIN_TEXT = "[Kein Text erkannt: Das Modell hat die Seite als Bild eingestuft]"
+
+
+def bildverweise_entfernen(bloecke):
+    """Entfernt Bildverweise ohne Koordinaten aus den Blockinhalten."""
+    return [(typ, box, BILDVERWEIS.sub("", inhalt).strip()) for typ, box, inhalt in bloecke]
+
+
+def nur_bild(antwort: str, bloecke) -> bool:
+    """True, wenn das Modell auf der Seite keinen Text erkannt, sondern sie als
+    Bild eingestuft hat: kein Textblock mit Inhalt und dafür ein Bildverweis
+    ohne Koordinaten oder Bildboxen über mindestens die halbe Seite. Leere
+    Seiten und ein kleines Logo auf einer sonst leeren Seite zählen nicht.
+    bloecke: schon ohne Bildverweise (bildverweise_entfernen)."""
+    if any(inhalt for typ, _, inhalt in bloecke if typ not in BILD_TYPEN):
+        return False
+    if BILDVERWEIS.search(antwort):
+        return True
+    flaeche = sum((x1 - x0) * (y1 - y0) for typ, (x0, y0, x1, y1), _ in bloecke
+                  if typ in BILD_TYPEN)
+    return flaeche >= 0.5 * 1000 * 1000
+
+
+def seite_erkennen(modell: str, png: bytes, prompt: str, empfangen=None, melden=_melden):
+    """OCR einer Seite, liefert (Antwort, Blöcke). Hält LightOnOCR die ganze
+    Seite für ein Bild (passiert z. B. bei Zeitleisten oder Schaubildern mit
+    wenig Text), wird einmal im anderen LightOnOCR-Modus nachgefragt
+    ("grounding" ↔ ""). Bringt auch das keinen Text, bleibt das erste Ergebnis."""
+    antwort = ocr(modell, png, prompt, empfangen=empfangen)
+    bloecke = bildverweise_entfernen(bloecke_parsen(antwort))
+    if prompt in ("grounding", "") and nur_bild(antwort, bloecke):
+        anderer = "" if prompt == "grounding" else "grounding"
+        melden("   Das Modell hat die Seite als Bild eingestuft – zweiter Versuch im Modus "
+               + ("„nur Text“" if anderer == "" else "„grounding“") + " …")
+        zweite = ocr(modell, png, anderer, empfangen=empfangen)
+        zweite_bloecke = bildverweise_entfernen(bloecke_parsen(zweite))
+        if any(inhalt for typ, _, inhalt in zweite_bloecke if typ not in BILD_TYPEN):
+            return zweite, zweite_bloecke
+        melden("   Auch im zweiten Versuch kein Text erkannt.")
+    return antwort, bloecke
+
+
 def als_markdown(bloecke, bilder=None) -> str:
     """Markdown ohne Platzhalter. Ausgeschnittene Bilder werden an ihrer Stelle
     eingefügt (Beschreibung des Modells als Bildunterschrift)."""
@@ -683,7 +729,8 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
                 fortschritt(nr - 1, gesamt)
             anzeige.seite_beginnt(datei.name, nr, gesamt)
             try:
-                antwort = ocr(modell, seite_als_png(seite), prompt, empfangen=anzeige.empfangen)
+                antwort, bloecke = seite_erkennen(modell, seite_als_png(seite), prompt,
+                                                  empfangen=anzeige.empfangen, melden=melden)
             except Exception as f:
                 anzeige.seite_fertig(erfolgreich=False)
                 if not seitenfehler(f):
@@ -697,10 +744,13 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
             rest = anzeige.mittlere_dauer() * (gesamt - nr)
             melden(f"   fertig nach {dauer_text(dauer)} ({len(antwort)} Zeichen)"
                    + (f", noch ca. {dauer_text(rest)} für diese Datei" if nr < gesamt else ""))
-            bloecke = bloecke_parsen(antwort)
             bilder = bilder_ausschneiden(seite, bloecke, bild_ordner, nr)
             links = {i: f"{bild_ordner.name}/{d.name}" for i, (d, _, _) in bilder.items()}
-            teile.append(f"## Seite {nr}\n\n{als_markdown(bloecke, links)}")
+            inhalt = als_markdown(bloecke, links)
+            if not bilder and not inhalt.strip():
+                inhalt = f"*{KEIN_TEXT}*"
+                melden(f"   ⚠ Seite {nr}: {KEIN_TEXT[1:-1]}")
+            teile.append(f"## Seite {nr}\n\n{inhalt}")
             if pdf:
                 # Bilder als eigene Objekte deckungsgleich an die Originalstelle legen
                 bilder_einfuegen(seite, bilder)
