@@ -172,9 +172,10 @@ Details stehen in der [ausführlichen Anleitung](docs/Anleitung.docx).
 | model not found | Modellnamen mit bzw. ohne `user.` versuchen |
 | „returned no visible answer“ / leere Ausgabe | `--reasoning off` in den Modell-Einstellungen |
 | `[WARNUNG: Ausgabe abgeschnitten]` | Kontextgröße erhöhen (16384 oder mehr) |
-| Bild wird ignoriert | Modell ohne MMProj geladen, neu herunterladen |
+| Bild wird ignoriert, Antwort hat nichts mit dem Bild zu tun (z. B. fremdsprachiger Text, immer dieselbe Frage) oder `[Kein Text erkannt …]` bei jedem Bild | Das Modell sieht das Bild nicht, meist fehlt das MMProj. In Lemonade unter **Models** prüfen, ob beim Modell „Vision projector (MMProj)“ steht, und das Bild im Chat der Lemonade-App testen („Was steht auf dem Bild?“). Sonst Modell löschen und neu herunterladen |
 | Bild abgeschnitten | in `ocr.py` den Wert `rand = 4` erhöhen |
 | `✖ Seite N nicht erkannt` | Zeitüberschreitung oder Serverfehler bei dieser Seite. Die übrigen Seiten sind gespeichert. Datei später erneut verarbeiten (im Eingabe-Ordner passiert das beim nächsten Start automatisch) |
+| `ErrorDeviceLost` / `vk::Device` | Die Grafikkarte ist im Lemonade Server abgestürzt (Vulkan, oft bei schwacher integrierter Grafik und großen Bildern). Server neu starten (Linux: `systemctl --user restart lemond`), in Lemonade das CPU-Backend wählen. Die Seite wird übersprungen, die übrigen werden weiter verarbeitet |
 | `[UNVOLLSTÄNDIG: …]` im Ergebnis | Verarbeitung wurde abgebrochen oder die Verbindung ist abgerissen. Datei erneut verarbeiten |
 | „enthielten schon Text – dort wurde keine zweite Textebene eingefügt“ | Hinweis, kein Fehler: Die PDF-Seite war schon durchsuchbar |
 | `[Kein Text erkannt: Das Modell hat die Seite als Bild eingestuft]` | Das Modell hielt die ganze Seite für ein Bild (kommt bei Zeitleisten, Schaubildern und Screenshots mit viel Leerraum vor). Das Programm fragt dann schon automatisch ein zweites Mal im anderen Modus nach. Hilft das nicht: Bild auf den Textbereich zuschneiden oder das größere Modell (4B statt 0.8B) nehmen |

@@ -24,10 +24,10 @@ from testseite import ocr
 STILL = lambda _text: None  # noqa: E731
 
 
-def _fehler(klasse):
+def _fehler(klasse, text="Testfehler"):
     """openai-Fehler ohne echte HTTP-Anfrage erzeugen (unabhängig von der Version)."""
     f = klasse.__new__(klasse)
-    Exception.__init__(f, "Testfehler")
+    Exception.__init__(f, text)
     return f
 
 
@@ -177,10 +177,13 @@ class GanzeSeiteAlsBildTest(Grundlage):
         self.assertNotIn("Kein Text erkannt", md)
 
     def test_unbrauchbar(self):
-        for text in ('"\n' * 73, "....................", "ab\n" * 12, '" " " "\n" "'):
+        frage = "".join(f"{i}. Welche Verbindung ist ein Kohlenwasserstoff?\n   A. Ethanol\n   B. Ethen\n"
+                        "   C. Essigsäure\n   D. Glucose\n\n" for i in range(1, 21))
+        for text in ('"\n' * 73, "....................", "ab\n" * 12, '" " " "\n" "', frage):
             self.assertTrue(ocr.unbrauchbar(text), text)
         for text in ("", "1", "Datum: 03.03.", "| 1 | 2 |\n|---|---|\n| 3 | 4 |",
-                     self.antwort, "Ja\nNein\n" * 3):
+                     self.antwort, "Ja\nNein\n" * 3,
+                     "\n".join(f"| {i} | Position {i} | {i * 3},50 € |" for i in range(40))):
             self.assertFalse(ocr.unbrauchbar(text), text)
 
     def test_anderer_prompt_ohne_zweiten_versuch(self):
@@ -222,6 +225,20 @@ class SeitenfehlerTest(Grundlage):
         self.assertIn(ocr.SEITE_FEHLT, md)
         self.assertEqual(len(fitz.open(self.tmp / "Beispiel.ocr.pdf")), 3)
         self.assertFalse(ocr.ist_erledigt(self.tmp / "Beispiel.pdf", self.tmp, "Beispiel"))
+
+    def test_fehler_im_stream_betrifft_nur_die_seite(self):
+        absturz = _fehler(openai.APIError, "decode() failed: vk::Device::waitForFences: ErrorDeviceLost")
+        self.assertTrue(ocr.seitenfehler(absturz))
+        self.assertIn("CPU-Backend", ocr.fehler_hinweis(absturz))
+        self.assertEqual(ocr.fehler_hinweis(zeitueberschreitung()), "")
+
+        def ocr_mit_absturz(modell, png, prompt, empfangen=None):
+            raise absturz
+        meldungen = []
+        with mock.patch.object(ocr, "ocr", ocr_mit_absturz):
+            with self.assertRaises(ocr.SeitenFehler):
+                ocr.verarbeiten("x", self.scan(), melden=meldungen.append)
+        self.assertTrue(any("systemctl --user restart lemond" in m for m in meldungen))
 
     def test_verbindung_weg_speichert_teilergebnis(self):
         aufrufe = []
