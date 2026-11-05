@@ -103,6 +103,62 @@ class TextebeneTest(Grundlage):
         self.assertIn("](<Beispiel.ocr-bilder/seite01-bild01.png>)", md)
 
 
+class GanzeSeiteAlsBildTest(Grundlage):
+    """LightOnOCR stuft manchmal eine ganze Seite (z. B. eine Zeitleiste) als
+    Bild ein und antwortet nur mit "![image](image_1.png)"."""
+    BILD = "![image](image_1.png)"
+
+    def mit_antworten(self, antworten):
+        aufrufe = []
+
+        def fake(modell, png, prompt, empfangen=None):
+            aufrufe.append(prompt)
+            return antworten[prompt]
+        patcher = mock.patch.object(ocr, "ocr", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return aufrufe
+
+    def test_zweiter_versuch_ohne_grounding(self):
+        aufrufe = self.mit_antworten({"grounding": self.BILD, "": "1917 Oktoberrevolution\n\n1919 Vertrag"})
+        erzeugt = ocr.verarbeiten("x", self.scan(), pdf=True, melden=STILL)
+        self.assertEqual(aufrufe, ["grounding", ""])
+        md = erzeugt[0].read_text(encoding="utf-8")
+        self.assertIn("1917 Oktoberrevolution", md)
+        self.assertNotIn("image_1.png", md)
+        self.assertIn("Oktoberrevolution", fitz.open(erzeugt[1])[0].get_text())
+
+    def test_ganze_seite_als_bild_mit_koordinaten(self):
+        aufrufe = self.mit_antworten({"grounding": "![image](0,0,1000,1000)\nZeitleiste", "": "Text"})
+        md = ocr.verarbeiten("x", self.scan(), melden=STILL)[0].read_text(encoding="utf-8")
+        self.assertEqual(aufrufe, ["grounding", ""])
+        self.assertIn("Text", md)
+
+    def test_kein_text_auch_im_zweiten_versuch(self):
+        aufrufe = self.mit_antworten({"grounding": self.BILD, "": self.BILD})
+        meldungen = []
+        erzeugt = ocr.verarbeiten("x", self.scan(), pdf=True, melden=meldungen.append)
+        self.assertEqual(aufrufe, ["grounding", ""])
+        md = erzeugt[0].read_text(encoding="utf-8")
+        self.assertIn(ocr.KEIN_TEXT, md)
+        self.assertNotIn("image_1.png", md)
+        self.assertNotIn("image", fitz.open(erzeugt[1])[0].get_text())
+        self.assertTrue(any("Kein Text erkannt" in m for m in meldungen))
+        self.assertTrue(ocr.ist_erledigt(Path(self.tmp / "Beispiel.pdf"), self.tmp, "Beispiel"))
+
+    def test_leere_seite_und_normale_seite_ohne_zweiten_versuch(self):
+        aufrufe = self.mit_antworten({"grounding": ""})
+        ocr.verarbeiten("x", self.scan(), melden=STILL)
+        aufrufe2 = self.mit_antworten({"grounding": self.antwort})
+        ocr.verarbeiten("x", self.scan(), melden=STILL)
+        self.assertEqual(aufrufe + aufrufe2, ["grounding", "grounding"])
+
+    def test_anderer_prompt_ohne_zweiten_versuch(self):
+        aufrufe = self.mit_antworten({"OCR:": self.BILD})
+        ocr.verarbeiten("x", self.scan(), prompt="OCR:", melden=STILL)
+        self.assertEqual(aufrufe, ["OCR:"])
+
+
 class KlartextTest(unittest.TestCase):
     def test_hervorhebung(self):
         self.assertEqual(ocr.als_klartext("**fett**, *kursiv*, _unter_, `code`"),
