@@ -1,0 +1,2 @@
+openai>=1.40
+pymupdf>=1.24.3
