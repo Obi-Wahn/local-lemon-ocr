@@ -7,7 +7,8 @@ Lokale Texterkennung (OCR) für PDFs und Bilder mit **LightOnOCR-3** über einen
 - 📝 **Export** als Markdown, Word (`.docx`) und LibreOffice (`.odt`), mit echten Tabellen und Formeln
 - 📂 **Eingabe- und Ausgabe-Ordner:** Alles verarbeiten, was im Eingabe-Ordner liegt, auf Wunsch laufend überwacht (Hotfolder). Erledigte Dateien werden übersprungen.
 - 🛟 **Robust:** Scheitert eine Seite, geht es mit der nächsten weiter. Bei Abbruch bleibt das bisher Erkannte erhalten.
-- 🖱️ **Grafische Oberfläche** für die Verarbeitung mehrerer Dateien, dazu eine Kommandozeile für Skripte
+- ⏱️ **Live-Fortschritt:** Laufzeit, empfangener Text und geschätzte Restzeit, auch während eine langsame Seite noch läuft
+- 🖱️ **Grafische Oberfläche** mit Qt (läuft unter Linux nativ auf Wayland), dazu eine Kommandozeile für Skripte
 
 ![Grafische Oberfläche](docs/gui.png)
 
@@ -19,9 +20,9 @@ Lokale Texterkennung (OCR) für PDFs und Bilder mit **LightOnOCR-3** über einen
 
 | | |
 |---|---|
-| Betriebssystem | Windows 11 (Linux funktioniert ebenfalls) |
-| Grafikkarte | ab 8 GB VRAM, mit 16 GB läuft das 4B-Modell in bester Qualität |
-| Software | [Lemonade](https://lemonade-server.ai/), Python ab 3.10, optional [Pandoc](https://pandoc.org/) für Word/LibreOffice |
+| Betriebssystem | Windows 11 oder Linux (getestet mit KDE/Wayland) |
+| Grafikkarte | ab 8 GB VRAM, mit 16 GB läuft das 4B-Modell in bester Qualität. Ohne eigene Grafikkarte läuft es auf dem Prozessor, aber deutlich langsamer (dann das 0.8B-Modell nehmen) |
+| Software | [Lemonade](https://lemonade-server.ai/), Python ab 3.10 mit `openai`, `pymupdf` und `PySide6`, optional [Pandoc](https://pandoc.org/) für Word/LibreOffice |
 
 ## Installation
 
@@ -52,18 +53,38 @@ PowerShell danach neu öffnen, dann im Projektordner:
 pip install -r requirements.txt
 ```
 
+### Linux (z. B. Fedora)
+
+```bash
+sudo dnf install pandoc dejavu-sans-fonts      # Pandoc optional
+python3 -m pip install --user -r requirements.txt
+```
+
+`dejavu-sans-fonts` sorgt für eine Unicode-Schrift in der Textebene, sonst fehlt zum Beispiel das €-Zeichen.
+
+Beim Lemonade-Paket für Linux sind `lemonade` und `lemonade-web-app` nur Clients. Der eigentliche Server heißt **`lemond`** und muss laufen, sonst meldet die Web-App `ERR_CONNECTION_REFUSED`:
+
+```bash
+systemctl --user start lemond            # nur für diese Sitzung
+systemctl --user enable --now lemond     # oder: bei jeder Anmeldung automatisch
+lemonade status
+```
+
+Läuft Lemonade auf einem anderen Rechner im Heimnetz (zum Beispiel einem PC mit Grafikkarte), trägst du dessen Adresse in der Oberfläche ein oder nutzt `--url`.
+
 ## Benutzung
 
 ### Grafische Oberfläche
 
-Doppelklick auf **`ocr_gui.pyw`** (oder `pythonw ocr_gui.pyw`). `ocr.py` muss im selben Ordner liegen.
+Doppelklick auf **`ocr_gui.pyw`** (oder `pythonw ocr_gui.pyw`, unter Linux `python3 ocr_gui.pyw`). `ocr.py` muss im selben Ordner liegen. Die Oberfläche nutzt Qt (PySide6) und läuft unter Linux nativ auf Wayland, ohne XWayland.
 
 1. Das Programm verbindet sich mit Lemonade und wählt automatisch ein OCR-Modell. Läuft der Server noch nicht, kannst du den Modellnamen auch eintippen.
-2. Dateien hinzufügen. Du kannst sie auch direkt auf das Programmsymbol ziehen.
+2. Dateien hinzufügen. Du kannst sie auch direkt ins Fenster oder auf das Programmsymbol ziehen. Ein ins Fenster gezogener Ordner wird als Eingabe-Ordner eingetragen.
 3. Oder einen **Eingabe-Ordner** ankreuzen: Dann werden alle PDFs und Bilder darin verarbeitet. Schon erledigte Dateien überspringt das Programm (außer mit „Bereits erledigte erneut verarbeiten“).
 4. Mit **Ordner überwachen** prüft das Programm alle 10 Sekunden, ob neue Dateien dazugekommen sind, und verarbeitet sie, sobald sie fertig kopiert sind. **Abbrechen** beendet die Überwachung.
 5. Optional einen **Ausgabe-Ordner** wählen, sonst landen die Ergebnisse neben der Originaldatei.
 6. Ausgabeformate ankreuzen und **Start** klicken.
+7. Während der Verarbeitung zeigen Balken und Statuszeile live, was passiert, zum Beispiel `Datei 1/3: Beispiel.pdf – Seite 2/5 · 1:23 · Text kommt an (340 Zeichen) · noch ca. 4:10`. „Bild wird ausgewertet“ heißt, dass das Modell das Seitenbild noch liest und noch keinen Text schickt. Das dauert ohne Grafikkarte am längsten. Die Restzeit wird aus der Dauer der bisherigen Seiten geschätzt, sie erscheint also ab der zweiten Seite.
 
 Die Einstellungen werden in `~/.ocr-gui.json` gespeichert, der API-Key bewusst nicht.
 
@@ -80,6 +101,14 @@ python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 a.pdf b.pdf -o Ergebnisse --pdf
 python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 -e Eingang -o Ergebnisse --pdf --ueberwachen
 python ocr.py user.PaddleOCR-VL-1.6-GGUF scan.png -p "OCR:"
 ```
+
+Im Terminal zeigt eine Live-Zeile den Fortschritt, die jede Sekunde neu gezeichnet wird:
+
+```
+[########------------]  40 % Beispiel.pdf: Seite 2/5 · 1:23 · Text kommt an (340 Zeichen) · noch ca. 4:10
+```
+
+Nach jeder Seite folgt eine Meldung wie `fertig nach 2:05 (2140 Zeichen), noch ca. 6:15 für diese Datei`. Beim Umleiten in eine Datei entfällt die Live-Zeile, die Meldungen bleiben.
 
 `python ocr.py --help` zeigt alle Optionen. Die alte Schreibweise mit dem Prompt als drittem Argument (`scan.png "OCR:"`) funktioniert weiterhin.
 
@@ -138,7 +167,7 @@ Details stehen in der [ausführlichen Anleitung](docs/Anleitung.docx).
 
 | Problem | Lösung |
 |---|---|
-| Connection refused | Lemonade-App starten, Port mit `lemonade config` prüfen |
+| Connection refused | Lemonade-App starten (Linux: `systemctl --user start lemond`), Port mit `lemonade config` prüfen |
 | Fehler 401 | API-Key setzen: `$env:LEMONADE_API_KEY = "…"` |
 | model not found | Modellnamen mit bzw. ohne `user.` versuchen |
 | „returned no visible answer“ / leere Ausgabe | `--reasoning off` in den Modell-Einstellungen |
@@ -165,7 +194,7 @@ Die Tests brauchen keinen Lemonade Server: Statt `ocr.ocr` liefert eine Fake-Fun
 python -m unittest discover -s tests -v
 ```
 
-Der GUI-Test läuft nur mit Display. Unter Linux headless: `xvfb-run python -m unittest discover -s tests -v`.
+Der GUI-Test braucht PySide6 und läuft ohne Bildschirm über die Qt-Plattform `offscreen`, ohne PySide6 wird er übersprungen.
 
 ## Lizenz
 
