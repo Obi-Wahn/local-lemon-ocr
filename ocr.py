@@ -304,6 +304,7 @@ def bloecke_parsen(text: str):
 # aber nicht im grounding-Format. Die Datei gibt es nicht, der Link wäre kaputt.
 BILDVERWEIS = re.compile(r"!\[[^\]\n]*\]\((?!\s*\d+(?:\.\d+)?\s*,)[^)\n]*\)")
 KEIN_TEXT = "[Kein Text erkannt: Das Modell hat die Seite als Bild eingestuft]"
+UNBRAUCHBAR = "[Kein Text erkannt: Die Antwort des Modells war unbrauchbar (nur Sonderzeichen oder Wiederholungen)]"
 
 
 def bildverweise_entfernen(bloecke):
@@ -326,23 +327,64 @@ def nur_bild(antwort: str, bloecke) -> bool:
     return flaeche >= 0.5 * 1000 * 1000
 
 
+def textinhalt(bloecke) -> str:
+    """Der Text aller Blöcke, die keine Bilder sind."""
+    return "\n".join(inhalt for typ, _, inhalt in bloecke if typ not in BILD_TYPEN and inhalt)
+
+
+def unbrauchbar(text: str) -> bool:
+    """True, wenn die Antwort Text enthält, der keiner ist: nur Sonderzeichen
+    (z. B. 70 Zeilen mit einem einzelnen Anführungszeichen) oder dieselbe
+    kurze Zeile immer wieder. So sieht es aus, wenn das Modell in eine
+    Wiederholungsschleife gerät. Eine leere Antwort ist nicht unbrauchbar."""
+    zeichen = "".join(text.split())
+    if not zeichen:
+        return False
+    buchstaben = sum(c.isalnum() for c in zeichen)
+    if buchstaben == 0 and len(zeichen) >= 3:
+        return True
+    if len(zeichen) >= 20 and buchstaben < 0.1 * len(zeichen):
+        return True
+    zeilen = [z.strip() for z in text.splitlines() if z.strip()]
+    return len(zeilen) >= 10 and len(set(zeilen)) <= 2 and all(len(z) <= 5 for z in zeilen)
+
+
+def _pruefen(antwort: str, bloecke):
+    """None, wenn die Seite brauchbaren Text (oder gar nichts) enthält, sonst
+    der Hinweis, warum kein Text erkannt wurde."""
+    if nur_bild(antwort, bloecke):
+        return KEIN_TEXT
+    if unbrauchbar(textinhalt(bloecke)):
+        return UNBRAUCHBAR
+    return None
+
+
 def seite_erkennen(modell: str, png: bytes, prompt: str, empfangen=None, melden=_melden):
-    """OCR einer Seite, liefert (Antwort, Blöcke). Hält LightOnOCR die ganze
-    Seite für ein Bild (passiert z. B. bei Zeitleisten oder Schaubildern mit
-    wenig Text), wird einmal im anderen LightOnOCR-Modus nachgefragt
-    ("grounding" ↔ ""). Bringt auch das keinen Text, bleibt das erste Ergebnis."""
+    """OCR einer Seite, liefert (Antwort, Blöcke, Hinweis). Hält LightOnOCR die
+    ganze Seite für ein Bild (passiert z. B. bei Zeitleisten oder Schaubildern
+    mit wenig Text) oder ist die Antwort unbrauchbar (Wiederholungsschleife),
+    wird einmal im anderen LightOnOCR-Modus nachgefragt ("grounding" ↔ "").
+    Hilft das nicht, wird unbrauchbarer Text verworfen, damit er weder im
+    Markdown noch in der Textebene landet. Hinweis ist dann KEIN_TEXT oder
+    UNBRAUCHBAR, sonst None (auch bei einer leeren Seite)."""
     antwort = ocr(modell, png, prompt, empfangen=empfangen)
     bloecke = bildverweise_entfernen(bloecke_parsen(antwort))
-    if prompt in ("grounding", "") and nur_bild(antwort, bloecke):
+    hinweis = _pruefen(antwort, bloecke)
+    if hinweis and prompt in ("grounding", ""):
         anderer = "" if prompt == "grounding" else "grounding"
-        melden("   Das Modell hat die Seite als Bild eingestuft – zweiter Versuch im Modus "
+        grund = ("Das Modell hat die Seite als Bild eingestuft" if hinweis == KEIN_TEXT
+                 else "Die Antwort des Modells war unbrauchbar")
+        melden(f"   {grund} – zweiter Versuch im Modus "
                + ("„nur Text“" if anderer == "" else "„grounding“") + " …")
         zweite = ocr(modell, png, anderer, empfangen=empfangen)
         zweite_bloecke = bildverweise_entfernen(bloecke_parsen(zweite))
-        if any(inhalt for typ, _, inhalt in zweite_bloecke if typ not in BILD_TYPEN):
-            return zweite, zweite_bloecke
+        if textinhalt(zweite_bloecke) and not _pruefen(zweite, zweite_bloecke):
+            return zweite, zweite_bloecke, None
         melden("   Auch im zweiten Versuch kein Text erkannt.")
-    return antwort, bloecke
+    if hinweis == UNBRAUCHBAR:
+        # Bilder behalten, den unbrauchbaren Text verwerfen
+        bloecke = [(typ, box, inhalt if typ in BILD_TYPEN else "") for typ, box, inhalt in bloecke]
+    return antwort, bloecke, hinweis
 
 
 def als_markdown(bloecke, bilder=None) -> str:
@@ -729,7 +771,7 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
                 fortschritt(nr - 1, gesamt)
             anzeige.seite_beginnt(datei.name, nr, gesamt)
             try:
-                antwort, bloecke = seite_erkennen(modell, seite_als_png(seite), prompt,
+                antwort, bloecke, hinweis = seite_erkennen(modell, seite_als_png(seite), prompt,
                                                   empfangen=anzeige.empfangen, melden=melden)
             except Exception as f:
                 anzeige.seite_fertig(erfolgreich=False)
@@ -747,9 +789,9 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
             bilder = bilder_ausschneiden(seite, bloecke, bild_ordner, nr)
             links = {i: f"{bild_ordner.name}/{d.name}" for i, (d, _, _) in bilder.items()}
             inhalt = als_markdown(bloecke, links)
-            if not bilder and not inhalt.strip():
-                inhalt = f"*{KEIN_TEXT}*"
-                melden(f"   ⚠ Seite {nr}: {KEIN_TEXT[1:-1]}")
+            if hinweis and not inhalt.strip():
+                inhalt = f"*{hinweis}*"
+                melden(f"   ⚠ Seite {nr}: {hinweis[1:-1]}")
             teile.append(f"## Seite {nr}\n\n{inhalt}")
             if pdf:
                 # Bilder als eigene Objekte deckungsgleich an die Originalstelle legen

@@ -178,6 +178,7 @@ Details stehen in der [ausführlichen Anleitung](docs/Anleitung.docx).
 | `[UNVOLLSTÄNDIG: …]` im Ergebnis | Verarbeitung wurde abgebrochen oder die Verbindung ist abgerissen. Datei erneut verarbeiten |
 | „enthielten schon Text – dort wurde keine zweite Textebene eingefügt“ | Hinweis, kein Fehler: Die PDF-Seite war schon durchsuchbar |
 | `[Kein Text erkannt: Das Modell hat die Seite als Bild eingestuft]` | Das Modell hielt die ganze Seite für ein Bild (kommt bei Zeitleisten, Schaubildern und Screenshots mit viel Leerraum vor). Das Programm fragt dann schon automatisch ein zweites Mal im anderen Modus nach. Hilft das nicht: Bild auf den Textbereich zuschneiden oder das größere Modell (4B statt 0.8B) nehmen |
+| `[Kein Text erkannt: Die Antwort des Modells war unbrauchbar …]` | Das Modell ist in eine Wiederholungsschleife geraten und hat z. B. nur Anführungszeichen geliefert. Auch hier fragt das Programm automatisch ein zweites Mal im anderen Modus nach und verwirft den Müll. Abhilfe wie oben: zuschneiden oder das 4B-Modell nehmen |
 | `PDF ist passwortgeschützt` | PDF zuerst ohne Passwort speichern |
 | `Pandoc-Fehler: …` | Die Meldung kommt direkt von Pandoc, meist ist Pandoc zu alt oder die Zieldatei ist noch in Word geöffnet |
 | Datei im überwachten Ordner wird nicht verarbeitet | Sie wird erst genommen, wenn sie sich zwischen zwei Prüfungen nicht mehr ändert. Nach einem Fehler wird sie erst wieder versucht, wenn sie sich ändert oder das Programm neu startet |
