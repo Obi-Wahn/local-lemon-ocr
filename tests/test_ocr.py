@@ -398,6 +398,14 @@ class StreamingTest(unittest.TestCase):
         # Denkmodus bleibt abgeschaltet (siehe CLAUDE.md)
         self.assertEqual(argumente["extra_body"], {"chat_template_kwargs": {"enable_thinking": False}})
 
+    def test_denk_block_wird_entfernt(self):
+        self.assertEqual(ocr._antwort_text("<think>\n\n</think>\n\n# Vorwort\nText", "", "stop"),
+                         "# Vorwort\nText")
+        self.assertEqual(ocr._antwort_text("\n</think>\nText", "", "stop"), "Text")
+        self.assertEqual(ocr._antwort_text("<think>Nur hier</think>", "", "stop"), "Nur hier")
+        self.assertEqual(ocr._antwort_text("a < b > c", "", "stop"), "a < b > c")
+        self.assertEqual(ocr._antwort_text("<think></think>", "Reasoning", "stop"), "Reasoning")
+
     def test_rueckfall_auf_reasoning_und_warnung(self):
         text, zaehler, _ = self.anfragen([_stueck(reasoning="Nur gedacht"), _stueck(grund="length")])
         self.assertTrue(text.startswith("Nur gedacht"))

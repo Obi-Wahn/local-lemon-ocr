@@ -166,8 +166,25 @@ def _reasoning(msg) -> str:
         or (getattr(msg, "model_extra", None) or {}).get("reasoning_content", "") or ""
 
 
+# Denk-Block der Qwen3.5-Vorlage. Trotz enable_thinking=False schreibt der
+# Server manchmal einen leeren "<think>\n\n</think>" vor die Antwort, bei
+# manchen Vorlagen fehlt das öffnende Tag.
+DENKEN = re.compile(r"<think>(.*?)</think>|^\s*(.*?)</think>", re.S)
+
+
+def denken_entfernen(text: str) -> str:
+    """Entfernt <think>…</think> aus der Antwort. Steht außerhalb nichts, wird
+    der Inhalt des Denk-Blocks genommen (wie beim Rückfall auf reasoning_content)."""
+    if "</think>" not in text:
+        return text
+    innen = []
+    rest = DENKEN.sub(lambda m: innen.append(m.group(1) or m.group(2) or "") or "", text)
+    rest = rest.replace("<think>", "").strip()
+    return rest or "\n".join(innen).strip()
+
+
 def _antwort_text(text, reasoning, grund) -> str:
-    text = text or ""
+    text = denken_entfernen(text or "")
     if not text.strip():
         # Fallback: Text steckt trotzdem im Reasoning-Feld
         text = reasoning or ""
