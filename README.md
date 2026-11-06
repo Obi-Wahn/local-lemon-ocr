@@ -223,6 +223,8 @@ Es gibt zwei Wege:
 | Problem | Lösung |
 |---|---|
 | Connection refused | Lemonade-App starten (Linux: `systemctl --user start lemond`), Port mit `lemonade config` prüfen |
+| Startprogramm: „Python-Pakete fehlen“ | Dem Python, mit dem `starten.pyw` läuft, fehlt z. B. PySide6. Die Meldung nennt den Python-Pfad und den passenden `pip install`-Befehl. Unter Windows können `py`, `python` und `python3` verschiedene Pythons sein |
+| Startprogramm: „Oberfläche startet nicht“ | Die Oberfläche ist gleich nach dem Start abgestürzt. Die Meldung zeigt die letzten Zeilen der Fehlerausgabe, vollständig steht sie in `local-lemon-ocr-gui.log` im Temp-Ordner (Windows: `%TEMP%`) |
 | „Lemonade nicht gefunden“ beim Startprogramm | Kein `lemond.service` und kein Programm `lemond`/`lemonade-server` gefunden. Startbefehl mit `--server-befehl "…"` oder `LEMONADE_START` angeben |
 | „Lemonade Server antwortet nicht“ beim Startprogramm | Der Server ist gestartet, antwortet aber nicht unter der Adresse. Port mit `lemonade config` prüfen und die Server-Adresse in der Oberfläche anpassen. Läuft der Server nur langsam an: `--warten 300` |
 | Fehler 401 | API-Key setzen: `$env:LEMONADE_API_KEY = "…"` |
