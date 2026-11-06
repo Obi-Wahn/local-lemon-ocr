@@ -74,9 +74,11 @@ class StartenTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="ocr-start-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
-        p = mock.patch.object(self.s, "EINSTELLUNGEN", self.tmp / "einstellungen.json")
-        p.start()
-        self.addCleanup(p.stop)
+        for name, wert in (("EINSTELLUNGEN", self.tmp / "einstellungen.json"),
+                           ("GUI_PROTOKOLL", self.tmp / "gui.log"), ("GUI_PRUEFZEIT", 3)):
+            p = mock.patch.object(self.s, name, wert)
+            p.start()
+            self.addCleanup(p.stop)
 
     def _http_server(self, status=200) -> str:
         klasse = type("Antwort", (_Antwort,), {"status": status})
@@ -206,6 +208,39 @@ class StartenTest(unittest.TestCase):
             self.assertEqual(self.s.main(["--url", "http://192.0.2.10:13305/api/v1",
                                           "--ohne-fenster", "--warten", "0"]), 0)
         starten.assert_not_called()
+
+    def test_gui_absturz_wird_gemeldet(self):
+        """Unter pythonw ginge ein Absturz der Oberfläche sonst unbemerkt verloren."""
+        url = self._http_server()
+        absturz = [sys.executable, "-c", "import sys; sys.stderr.write('ImportError: kein Qt\\n'); sys.exit(1)"]
+        with mock.patch.object(self.s, "gui_befehl", lambda d=(): absturz), \
+                mock.patch.object(self.s, "melden") as melden:
+            self.assertEqual(self.s.main(["--url", url]), 1)
+        titel, text, _ = melden.call_args.args
+        self.assertEqual(titel, "Oberfläche startet nicht")
+        self.assertIn("Fehlercode 1", text)
+        self.assertIn("ImportError: kein Qt", text)
+
+    def test_gui_laeuft_weiter(self):
+        langsam = [sys.executable, "-c", "import time; time.sleep(30)"]
+        with mock.patch.object(self.s, "gui_befehl", lambda d=(): langsam), \
+                mock.patch.object(self.s, "GUI_PRUEFZEIT", 1):
+            gui, fehler = self.s.gui_starten([])
+        self.addCleanup(lambda: (gui.kill(), gui.wait()))
+        self.assertIsNone(fehler)
+        self.assertIsNone(gui.poll())
+
+    def test_fehlende_pakete(self):
+        self.assertEqual(self.s.fehlende_pakete(), [] if QApplication else ["PySide6"])
+        echt = self.s.importlib.util.find_spec
+        with mock.patch.object(self.s.importlib.util, "find_spec",
+                               lambda n: None if n == "PySide6" else echt(n)), \
+                mock.patch.object(self.s, "melden") as melden, \
+                mock.patch.object(self.s, "gui_starten") as gui:
+            self.assertEqual(self.s.main(["--ohne-fenster"]), 1)
+        gui.assert_not_called()
+        self.assertIn("PySide6", melden.call_args.args[1])
+        self.assertIn("-m pip install -r requirements.txt", melden.call_args.args[1])
 
     def test_gui_befehl(self):
         befehl = self.s.gui_befehl(["Beispiel.pdf"])

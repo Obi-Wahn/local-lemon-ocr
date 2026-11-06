@@ -27,12 +27,14 @@ Läuft der Server auf einem anderen Rechner, wird nichts gestartet, nur kurz
 geprüft, ob er erreichbar ist.
 """
 import argparse
+import importlib.util
 import json
 import os
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -46,6 +48,10 @@ STANDARD_URL = "http://localhost:13305/api/v1"  # wie ocr.BASE_URL
 WARTEN = 120          # Sekunden, bis das Warten aufgegeben wird
 DESKTOP_DATEI = Path.home() / ".local/share/applications/local-lemon-ocr.desktop"
 LOKAL = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+PAKETE = {"PySide6": "PySide6", "openai": "openai", "pymupdf": "pymupdf"}   # Import-Name: pip-Name
+# Fehlerausgabe der Oberfläche; unter pythonw ginge sie sonst verloren
+GUI_PROTOKOLL = Path(tempfile.gettempdir()) / "local-lemon-ocr-gui.log"
+GUI_PRUEFZEIT = 8     # so lange wird geprüft, ob die Oberfläche gleich wieder abstürzt
 
 
 # ------------------------------------------------------------ Server-Adresse ---
@@ -274,12 +280,62 @@ def _ausgeben(text: str):
         print(text, file=sys.stderr)
 
 
+def fehlende_pakete() -> list[str]:
+    """pip-Namen der Pakete, die diesem Python für die Oberfläche fehlen."""
+    fehlend = []
+    for modul, paket in PAKETE.items():
+        try:
+            gefunden = importlib.util.find_spec(modul) is not None
+        except (ImportError, ValueError):
+            gefunden = False
+        if not gefunden:
+            fehlend.append(paket)
+    return fehlend
+
+
 def melden(titel: str, text: str, mit_fenster: bool):
     _ausgeben(f"{titel}: {text}")
-    if mit_fenster:
+    if not mit_fenster:
+        return
+    try:
         from PySide6.QtWidgets import QApplication, QMessageBox
-        QApplication.instance() or QApplication(sys.argv)
-        QMessageBox.warning(None, titel, text)
+    except ImportError:   # ohne Qt: unter Windows ein einfaches Meldungsfenster
+        if os.name == "nt":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text, titel, 0x30)
+        return
+    QApplication.instance() or QApplication(sys.argv)
+    QMessageBox.warning(None, titel, text)
+
+
+def gui_starten(dateien, pruefzeit: float = GUI_PRUEFZEIT) -> tuple[subprocess.Popen, str | None]:
+    """Oberfläche starten und kurz beobachten. Liefert den Prozess und eine
+    Fehlermeldung, falls sie gleich wieder mit Fehler beendet wurde."""
+    try:
+        protokoll = open(GUI_PROTOKOLL, "w", encoding="utf-8", errors="replace")
+    except OSError:
+        protokoll = subprocess.DEVNULL
+    befehl = gui_befehl(dateien)
+    gui = subprocess.Popen(befehl, cwd=ORDNER, stdin=subprocess.DEVNULL,
+                           stdout=protokoll, stderr=protokoll)
+    ende = time.monotonic() + pruefzeit
+    while time.monotonic() < ende and gui.poll() is None:
+        time.sleep(0.2)
+    code = gui.poll()
+    if code in (None, 0):
+        return gui, None
+    if protokoll is not subprocess.DEVNULL:
+        protokoll.close()
+    try:
+        ausgabe = GUI_PROTOKOLL.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        ausgabe = ""
+    zeilen = ausgabe.splitlines()[-15:]
+    text = f"Die Oberfläche wurde gleich nach dem Start mit Fehlercode {code} beendet.\n\nBefehl: " \
+           + subprocess.list2cmdline(befehl)
+    if zeilen:
+        text += "\n\n" + "\n".join(zeilen)
+    return gui, text
 
 
 HINWEIS = ("\n\nDie Oberfläche startet trotzdem. Den Server kannst du auch selbst starten "
@@ -309,11 +365,21 @@ def main(argv=None) -> int:
         return 0
 
     mit_fenster = not a.ohne_fenster
+    fehlend = fehlende_pakete()
+    if fehlend:
+        befehl = [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
+        zeile = subprocess.list2cmdline(befehl) if os.name == "nt" else shlex.join(befehl)
+        melden("Python-Pakete fehlen",
+               f"Diesem Python fehlen: {', '.join(fehlend)}\n{sys.executable}\n\n"
+               f"Installieren im Projektordner mit:\n{zeile}", mit_fenster)
+        return 1
     url = server_url(a.url)
     weg = prozess = None
     gestartet = False
 
-    if not erreichbar(url):
+    if erreichbar(url):
+        _ausgeben(f"Lemonade Server läuft schon: {url}")
+    else:
         if ist_lokal(url):
             weg = startweg_finden(a.server_befehl)
             if weg is None:
@@ -334,7 +400,13 @@ def main(argv=None) -> int:
             if fehler and fehler != "abgebrochen":
                 melden("Lemonade Server antwortet nicht", f"{fehler}\n\nAdresse: {url}" + HINWEIS, mit_fenster)
 
-    gui = subprocess.Popen(gui_befehl(a.dateien), cwd=ORDNER)
+    _ausgeben("Starte die Oberfläche …")
+    gui, fehler = gui_starten(a.dateien)
+    if fehler:
+        melden("Oberfläche startet nicht", fehler, mit_fenster)
+        if gestartet and a.stoppen:
+            server_stoppen(weg, prozess)
+        return 1
     if not (a.stoppen and gestartet):
         return 0
     try:
