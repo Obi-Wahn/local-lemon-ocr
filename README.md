@@ -97,6 +97,40 @@ Läuft Lemonade auf einem anderen Rechner im Heimnetz (zum Beispiel einem PC mit
 
 ## Benutzung
 
+### Startprogramm: Server und Oberfläche mit einem Klick
+
+**`starten.pyw`** startet den Lemonade Server, falls er noch nicht läuft, wartet, bis er antwortet, und öffnet dann die Oberfläche. Ein kleines Fenster zeigt solange „Lemonade Server wird gestartet …“, mit **Ohne Server weiter** geht es sofort zur Oberfläche. Einen Autostart richtet das Programm nicht ein.
+
+- **Windows:** Doppelklick auf `starten.pyw` (oder eine Verknüpfung dazu auf den Desktop ziehen).
+- **Linux:** einmal einen Eintrag im Anwendungsmenü anlegen, danach heißt das Programm dort **OCR mit Lemonade**:
+
+  ```bash
+  python3 starten.pyw --verknuepfung              # Fedora
+  ~/ocr-umgebung/bin/python starten.pyw --verknuepfung   # Mint/Ubuntu mit venv
+  ```
+
+  Der Eintrag merkt sich den Python, mit dem er angelegt wurde, also auch die venv. Ohne Menüeintrag: `python3 starten.pyw`.
+
+So startet das Programm den Server (das Erste, was passt):
+
+| System | Befehl |
+|---|---|
+| Fedora (RPM, Benutzerdienst) | `systemctl --user start lemond` |
+| Mint/Ubuntu (PPA, Systemdienst) | `systemctl start lemond`, dabei fragt das System nach dem Passwort |
+| Windows, Snap, ältere Versionen | Programm `lemond` bzw. `lemonade-server serve` |
+| alles andere | eigener Befehl mit `--server-befehl "…"` oder Umgebungsvariable `LEMONADE_START` |
+
+| Option | Wirkung |
+|---|---|
+| `--stoppen` | Server beim Schließen der Oberfläche wieder beenden, aber nur, wenn das Startprogramm ihn gestartet hat. Zusammen mit `--verknuepfung` landet die Option im Menüeintrag |
+| `--warten SEK` | höchstens so lange auf den Server warten (Standard 120). Danach startet die Oberfläche trotzdem, mit einem Hinweis |
+| `--url URL` | Adresse für die Prüfung, sonst die aus der Oberfläche, `LEMONADE_BASE_URL` oder `http://localhost:13305/api/v1`. Bei einem anderen Rechner wird nichts gestartet, nur kurz geprüft |
+| `--server-befehl B` | eigener Startbefehl für den Server |
+| `--ohne-fenster` | ohne Wartefenster, Meldungen nur im Terminal |
+| `--verknuepfung` | Linux: Menüeintrag `~/.local/share/applications/local-lemon-ocr.desktop` anlegen |
+
+Dateien, die du auf das Programmsymbol ziehst, landen wie gewohnt in der Liste der Oberfläche.
+
 ### Grafische Oberfläche
 
 Doppelklick auf **`ocr_gui.pyw`** (oder `pythonw ocr_gui.pyw`, unter Linux `python3 ocr_gui.pyw`). `ocr.py` muss im selben Ordner liegen. Die Oberfläche nutzt Qt (PySide6) und läuft unter Linux nativ auf Wayland, ohne XWayland.
@@ -189,6 +223,8 @@ Es gibt zwei Wege:
 | Problem | Lösung |
 |---|---|
 | Connection refused | Lemonade-App starten (Linux: `systemctl --user start lemond`), Port mit `lemonade config` prüfen |
+| „Lemonade nicht gefunden“ beim Startprogramm | Kein `lemond.service` und kein Programm `lemond`/`lemonade-server` gefunden. Startbefehl mit `--server-befehl "…"` oder `LEMONADE_START` angeben |
+| „Lemonade Server antwortet nicht“ beim Startprogramm | Der Server ist gestartet, antwortet aber nicht unter der Adresse. Port mit `lemonade config` prüfen und die Server-Adresse in der Oberfläche anpassen. Läuft der Server nur langsam an: `--warten 300` |
 | Fehler 401 | API-Key setzen: `$env:LEMONADE_API_KEY = "…"` |
 | model not found | Modellnamen mit bzw. ohne `user.` versuchen |
 | „returned no visible answer“ / leere Ausgabe | `--reasoning off` in den Modell-Einstellungen |
