@@ -4,7 +4,8 @@ Lokale Texterkennung (OCR) für PDFs und Bilder mit **LightOnOCR-3** über einen
 
 - 📄 **Durchsuchbares PDF im Original-Layout:** Die Seiten bleiben unverändert sichtbar, darüber liegt eine unsichtbare Textebene, zeilengenau an der richtigen Stelle.
 - 🖼️ **Bilderkennung:** Bilder, Logos und Diagramme werden ausgeschnitten und an ihrer Originalstelle eingefügt, mit Bildbeschreibung als Bildunterschrift.
-- 📝 **Export** als Markdown, Word (`.docx`) und LibreOffice (`.odt`), mit echten Tabellen und Formeln
+- 📝 **Export** als Markdown, Word (`.docx`) und LibreOffice (`.odt`), mit echten Tabellen und Formeln. Markdown ist optional.
+- 📚 **Zusammenfügen:** Mehrere Scans in frei wählbarer Reihenfolge zu einem PDF bzw. einer Word-Datei verbinden
 - 📂 **Eingabe- und Ausgabe-Ordner:** Alles verarbeiten, was im Eingabe-Ordner liegt, auf Wunsch laufend überwacht (Hotfolder). Erledigte Dateien werden übersprungen.
 - 🛟 **Robust:** Scheitert eine Seite, geht es mit der nächsten weiter. Bei Abbruch bleibt das bisher Erkannte erhalten.
 - ⏱️ **Live-Fortschritt:** Laufzeit, empfangener Text und geschätzte Restzeit, auch während eine langsame Seite noch läuft
@@ -140,15 +141,16 @@ Doppelklick auf **`ocr_gui.pyw`** (oder `pythonw ocr_gui.pyw`, unter Linux `pyth
 3. Oder einen **Eingabe-Ordner** ankreuzen: Dann werden alle PDFs und Bilder darin verarbeitet. Schon erledigte Dateien überspringt das Programm (außer mit „Bereits erledigte erneut verarbeiten“).
 4. Mit **Ordner überwachen** prüft das Programm alle 10 Sekunden, ob neue Dateien dazugekommen sind, und verarbeitet sie, sobald sie fertig kopiert sind. **Abbrechen** beendet die Überwachung.
 5. Optional einen **Ausgabe-Ordner** wählen, sonst landen die Ergebnisse neben der Originaldatei.
-6. Ausgabeformate ankreuzen und **Start** klicken.
-7. Während der Verarbeitung zeigen Balken und Statuszeile live, was passiert, zum Beispiel `Datei 1/3: Beispiel.pdf – Seite 2/5 · 1:23 · Text kommt an (340 Zeichen) · noch ca. 4:10`. „Bild wird ausgewertet“ heißt, dass das Modell das Seitenbild noch liest und noch keinen Text schickt. Das dauert ohne Grafikkarte am längsten. Die Restzeit wird aus der Dauer der bisherigen Seiten geschätzt, sie erscheint also ab der zweiten Seite.
+6. Ausgabeformate ankreuzen (Markdown, PDF, Word, LibreOffice; mindestens eines) und **Start** klicken.
+7. **Zu einer Datei zusammenfügen:** Mit „Alle Dateien zu einer Datei zusammenfügen“ entsteht aus allen Dateien der Liste (und den offenen Dateien im Eingabe-Ordner) ein einziges Ergebnis, z. B. ein PDF mit allen Seiten und eine Word-Datei mit dem ganzen Text. Nach **Start** fragt ein Fenster die Reihenfolge ab: Einträge mit **Nach oben**/**Nach unten** oder per Ziehen verschieben, **Nach Namen sortieren** ordnet alphabetisch. Dort trägst du auch den Namen des Ergebnisses ein (Standard `<erste Datei>-zusammen`). Gibt es schon Dateien mit diesem Namen, fragt das Programm vor dem Überschreiben nach. Die Reihenfolge lässt sich auch schon in der Dateiliste mit **Nach oben**/**Nach unten** vorbereiten. Beim Überwachen eines Ordners ist Zusammenfügen ausgeschaltet.
+8. Während der Verarbeitung zeigen Balken und Statuszeile live, was passiert, zum Beispiel `Datei 1/3: Beispiel.pdf – Seite 2/5 · 1:23 · Text kommt an (340 Zeichen) · noch ca. 4:10`. „Bild wird ausgewertet“ heißt, dass das Modell das Seitenbild noch liest und noch keinen Text schickt. Das dauert ohne Grafikkarte am längsten. Die Restzeit wird aus der Dauer der bisherigen Seiten geschätzt, sie erscheint also ab der zweiten Seite.
 
 Die Einstellungen werden in `~/.ocr-gui.json` gespeichert, der API-Key bewusst nicht.
 
 ### Kommandozeile
 
 ```powershell
-python ocr.py <Modell> [Datei ...] [-e EINGABE] [-o AUSGABE] [--ueberwachen] [-p PROMPT] [--pdf] [--docx] [--odt]
+python ocr.py <Modell> [Datei ...] [-e EINGABE] [-o AUSGABE] [--ueberwachen] [-p PROMPT] [--pdf] [--docx] [--odt] [--ohne-md] [-z NAME]
 ```
 
 ```powershell
@@ -156,6 +158,7 @@ python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 scan.jpg
 python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 dokument.pdf --pdf --docx
 python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 a.pdf b.pdf -o Ergebnisse --pdf
 python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 -e Eingang -o Ergebnisse --pdf --ueberwachen
+python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 Seite1.pdf Seite2.pdf Seite3.png -z Gesamt --pdf --docx --ohne-md
 python ocr.py user.PaddleOCR-VL-1.6-GGUF scan.png -p "OCR:"
 ```
 
@@ -173,7 +176,9 @@ Den Modellnamen zeigt `lemonade list`. Kommt die Meldung „model not found“, 
 
 | Option | Ergebnis |
 |---|---|
-| *(immer)* | `name.ocr.md`: Text als Markdown, eine Überschrift pro Seite |
+| *(Standard)* | `name.ocr.md`: Text als Markdown, ohne Überschrift „Seite 1“. Bei mehreren Seiten steht vor jeder Seite eine unsichtbare Marke `<!-- Seite 2 -->`, die in Word/LibreOffice nicht erscheint |
+| `--ohne-md` | keine Markdown-Datei, dann `--pdf`, `--docx` oder `--odt` angeben. Fehlen Seiten oder wurde abgebrochen, wird das Markdown trotzdem gespeichert (mit der Markierung), damit die Datei beim nächsten Lauf erneut verarbeitet wird; ein späterer vollständiger Lauf löscht dieses Teilergebnis wieder |
+| `-z NAME`, `--zusammen NAME` | alle angegebenen Dateien in genau dieser Reihenfolge zu einem Ergebnis `NAME.ocr.pdf`, `NAME.ocr.docx` … zusammenfügen. Mit `-e` kommen die offenen Dateien des Eingabe-Ordners alphabetisch dahinter. Nicht mit `--ueberwachen`. Im Markdown zeigen Marken wie `<!-- Seite2.pdf, Seite 1 -->`, woher eine Seite stammt |
 | *(bei Bildern)* | `name.ocr-bilder/`: ausgeschnittene Bilder als PNG mit 300 dpi |
 | `--pdf` | `name.ocr.pdf`: durchsuchbares PDF im Original-Layout |
 | `--docx` | `name.ocr.docx`: Word-Datei (braucht Pandoc) |
@@ -187,7 +192,7 @@ Den Modellnamen zeigt `lemonade list`. Kommt die Meldung „model not found“, 
 
 **Gleiche Dateinamen:** Kommen in einem Durchlauf zwei Dateien mit demselben Namen vor (z. B. `Beispiel.pdf` und `Beispiel.png`), bekommt die zweite die Endung bzw. eine Nummer angehängt: `Beispiel-png.ocr.md`, `Beispiel-2.ocr.md`.
 
-**Als erledigt** gilt eine Datei, wenn im Ausgabe-Ordner schon ein vollständiges `name.ocr.md` liegt, das neuer ist als die Datei. Teilergebnisse werden beim nächsten Lauf neu verarbeitet.
+**Als erledigt** gilt eine Datei, wenn im Ausgabe-Ordner schon ein Ergebnis (`name.ocr.md`, `.pdf`, `.docx` oder `.odt`) liegt, das neuer ist als die Datei. Liegt ein neueres Markdown dabei, muss es vollständig sein: Teilergebnisse werden beim nächsten Lauf neu verarbeitet. Zusammengefügte Dateien haben kein eigenes Ergebnis und werden deshalb im Eingabe-Ordner beim nächsten Lauf wieder angeboten.
 
 Der Rückgabewert ist 0, wenn alles geklappt hat, 1 bei Fehlern und 130 nach Strg+C.
 

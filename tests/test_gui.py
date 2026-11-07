@@ -141,6 +141,79 @@ class GuiTest(unittest.TestCase):
         self.assertIn("Fertig: 1 Datei(en)", self.app.lbl_status.text())
         self.assertEqual(self.app.balken.value(), 1000)
 
+    def test_ohne_markdown(self):
+        self.app._datei_hinzufuegen(t.scan_erzeugen(self.original, self.tmp / "Beispiel.pdf"))
+        self.app.chk_md.setChecked(False)
+        self.app.chk_pdf.setChecked(True)
+        self.app.starten()
+        self.warten(self.fertig)
+        self.assertTrue((self.tmp / "Beispiel.ocr.pdf").exists())
+        self.assertFalse((self.tmp / "Beispiel.ocr.md").exists())
+
+    def test_ohne_jede_ausgabe_wird_nicht_gestartet(self):
+        self.app._datei_hinzufuegen(t.scan_erzeugen(self.original, self.tmp / "Beispiel.pdf"))
+        for w in (self.app.chk_md, self.app.chk_pdf, self.app.chk_docx, self.app.chk_odt):
+            w.setChecked(False)
+        self.app.starten()
+        self.assertFalse(self.app.laeuft())
+        self.messagebox.information.assert_called()
+
+    def test_reihenfolge_in_der_liste(self):
+        for name in ("A.pdf", "B.pdf", "C.pdf"):
+            self.app._datei_hinzufuegen(self.tmp / name)
+        self.app.liste.setCurrentRow(2)
+        self.gui._eintrag_verschieben(self.app.liste, -1)
+        self.gui._eintrag_verschieben(self.app.liste, -1)
+        self.gui._eintrag_verschieben(self.app.liste, -1)   # oben angekommen, bleibt
+        self.assertEqual([Path(d).name for d in self.app.dateien()], ["C.pdf", "A.pdf", "B.pdf"])
+
+    def test_reihenfolge_dialog(self):
+        dialog = self.gui.ReihenfolgeDialog([self.tmp / "B.pdf", self.tmp / "A.pdf", self.tmp / "C.png"],
+                                            "B-zusammen")
+        dialog.liste.setCurrentRow(2)
+        self.gui._eintrag_verschieben(dialog.liste, -1)
+        self.assertEqual([d.name for d in dialog.dateien()], ["B.pdf", "C.png", "A.pdf"])
+        dialog.sortieren()
+        self.assertEqual([d.name for d in dialog.dateien()], ["A.pdf", "B.pdf", "C.png"])
+        dialog.ed_name.setText("Gesamt.pdf")
+        self.assertEqual(dialog.name(), "Gesamt")
+        dialog.deleteLater()
+
+    def test_zusammenfuegen(self):
+        ein, aus = self.tmp / "Eingang", self.tmp / "Ergebnisse"
+        ein.mkdir()
+        t.scan_erzeugen(self.original, ein / "Erstes.pdf")
+        t.scan_erzeugen(self.original, ein / "Zweites.pdf")
+        self.app._datei_hinzufuegen(t.scan_erzeugen(self.original, self.tmp / "Deckblatt.pdf"))
+        self.app.chk_eingabe.setChecked(True)
+        self.app.ed_eingabe.setText(str(ein))
+        self.app.chk_ziel.setChecked(True)
+        self.app.ed_ziel.setText(str(aus))
+        self.app.chk_pdf.setChecked(True)
+        self.app.chk_md.setChecked(False)
+        self.app.chk_zusammen.setChecked(True)
+        gefragt = []
+
+        def abfragen(dateien, ziel):
+            gefragt.append([d.name for d in dateien])
+            return [dateien[2], dateien[0], dateien[1]], "Gesamt"   # Zweites, Deckblatt, Erstes
+
+        with mock.patch.object(self.app, "_reihenfolge_abfragen", abfragen):
+            self.app.starten()
+            self.warten(self.fertig)
+        self.assertEqual(gefragt, [["Deckblatt.pdf", "Erstes.pdf", "Zweites.pdf"]])
+        self.assertEqual(sorted(p.name for p in aus.iterdir() if p.is_file()), ["Gesamt.ocr.pdf"])
+        self.assertEqual(len(ocr.fitz.open(aus / "Gesamt.ocr.pdf")), 3)
+        self.assertIn("Fertig: 1 Datei(en)", self.app.lbl_status.text())
+        self.assertIn("Zweites.pdf, Deckblatt.pdf, Erstes.pdf", self.app.log.toPlainText())
+
+    def test_zusammenfuegen_beim_ueberwachen_gesperrt(self):
+        self.app.chk_eingabe.setChecked(True)
+        self.app.chk_ueberwachen.setChecked(True)
+        self.assertFalse(self.app.chk_zusammen.isEnabled())
+        self.app.chk_ueberwachen.setChecked(False)
+        self.assertTrue(self.app.chk_zusammen.isEnabled())
+
     def test_einstellungen_ohne_api_key(self):
         self.app.ed_key.setText("geheim")
         self.app.ed_eingabe.setText(str(self.tmp))

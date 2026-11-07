@@ -6,6 +6,8 @@ Start:   Doppelklick auf ocr_gui.pyw   (ocr.py muss im selben Ordner liegen)
 Tipp:    Dateien lassen sich direkt ins Fenster oder auf das Programmsymbol ziehen.
          Mit Eingabe- und Ausgabe-Ordner (optional mit Überwachung) wird alles
          verarbeitet, was im Eingabe-Ordner liegt bzw. neu hinzukommt.
+         Mit „Zu einer Datei zusammenfügen“ entsteht aus mehreren Scans ein
+         Ergebnis; die Reihenfolge wird vor dem Start abgefragt.
 
 Benötigt: pip install openai pymupdf PySide6    (Pandoc nur für Word/LibreOffice)
 Die Oberfläche nutzt Qt (PySide6) und läuft unter Linux nativ auf Wayland,
@@ -23,9 +25,10 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout,
-    QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QVBoxLayout, QWidget,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -55,6 +58,80 @@ def _hinweis(text: str) -> QLabel:
     label.setWordWrap(True)
     label.setEnabled(False)          # grau, wie ein Hinweistext
     return label
+
+
+def _eintrag_verschieben(liste: QListWidget, schritt: int):
+    """Markierte Einträge einer Liste um eine Stelle nach oben (-1) oder unten (+1)."""
+    zeilen = sorted((liste.row(e) for e in liste.selectedItems()), reverse=schritt > 0)
+    grenze = 0 if schritt < 0 else liste.count() - 1
+    if not zeilen or grenze in zeilen:
+        return
+    for zeile in zeilen:
+        eintrag = liste.takeItem(zeile)
+        liste.insertItem(zeile + schritt, eintrag)
+        eintrag.setSelected(True)
+    liste.setCurrentRow(zeilen[-1] + schritt)
+
+
+class ReihenfolgeDialog(QDialog):
+    """Fragt vor dem Zusammenfügen die Reihenfolge der Scans und den Namen des
+    Ergebnisses ab. Reihenfolge per Knopf oder durch Ziehen in der Liste."""
+
+    def __init__(self, dateien, name: str, eltern=None):
+        super().__init__(eltern)
+        self.setWindowTitle("Reihenfolge festlegen")
+        self.resize(560, 420)
+        haupt = QVBoxLayout(self)
+        haupt.addWidget(QLabel("In dieser Reihenfolge werden die Dateien zu einer Datei zusammengefügt:"))
+        zeile = QHBoxLayout()
+        self.liste = QListWidget()
+        self.liste.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.liste.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        for d in dateien:
+            eintrag = QListWidgetItem(Path(d).name)
+            eintrag.setData(Qt.ItemDataRole.UserRole, str(d))
+            eintrag.setToolTip(str(d))
+            self.liste.addItem(eintrag)
+        self.liste.setCurrentRow(0)
+        zeile.addWidget(self.liste, 1)
+        knoepfe = QVBoxLayout()
+        for text, aktion in (("▲  Nach oben", lambda: _eintrag_verschieben(self.liste, -1)),
+                             ("▼  Nach unten", lambda: _eintrag_verschieben(self.liste, 1)),
+                             ("Nach Namen sortieren", self.sortieren)):
+            k = QPushButton(text)
+            k.clicked.connect(aktion)
+            knoepfe.addWidget(k)
+        knoepfe.addStretch()
+        zeile.addLayout(knoepfe)
+        haupt.addLayout(zeile, 1)
+        form = QFormLayout()
+        self.ed_name = QLineEdit(name)
+        form.addRow("Name des Ergebnisses:", self.ed_name)
+        haupt.addLayout(form)
+        haupt.addWidget(_hinweis("Daraus werden z. B. Name.ocr.pdf und Name.ocr.docx."))
+        knoepfe = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        knoepfe.button(QDialogButtonBox.StandardButton.Ok).setText("Zusammenfügen")
+        knoepfe.button(QDialogButtonBox.StandardButton.Cancel).setText("Abbrechen")
+        knoepfe.accepted.connect(self.accept)
+        knoepfe.rejected.connect(self.reject)
+        haupt.addWidget(knoepfe)
+
+    def sortieren(self):
+        self.liste.sortItems()
+
+    def dateien(self) -> list[Path]:
+        return [Path(self.liste.item(i).data(Qt.ItemDataRole.UserRole))
+                for i in range(self.liste.count())]
+
+    def name(self) -> str:
+        return ocr.zielname(self.ed_name.text())
+
+    def accept(self):
+        if not self.name():
+            QMessageBox.information(self, "Name fehlt", "Bitte einen Namen für das Ergebnis eingeben.")
+            return
+        super().accept()
 
 
 class OcrGui(QWidget):
@@ -117,7 +194,9 @@ class OcrGui(QWidget):
         zeile.addWidget(self.liste, 1)
         knoepfe = QVBoxLayout()
         for text, aktion in (("Hinzufügen …", self.dateien_waehlen), ("Entfernen", self.auswahl_entfernen),
-                             ("Liste leeren", self.liste.clear)):
+                             ("Liste leeren", self.liste.clear),
+                             ("▲  Nach oben", lambda: _eintrag_verschieben(self.liste, -1)),
+                             ("▼  Nach unten", lambda: _eintrag_verschieben(self.liste, 1))):
             k = QPushButton(text)
             k.clicked.connect(aktion)
             knoepfe.addWidget(k)
@@ -152,14 +231,17 @@ class OcrGui(QWidget):
         gruppe = QGroupBox("Ausgabe")
         raster = QGridLayout(gruppe)
         zeile = QHBoxLayout()
-        md = QCheckBox("Markdown (immer)", checked=True, enabled=False)
+        self.chk_md = QCheckBox("Markdown (.md)")
         self.chk_pdf = QCheckBox("Durchsuchbares PDF")
         self.chk_docx = QCheckBox("Word (.docx)")
         self.chk_odt = QCheckBox("LibreOffice (.odt)")
-        for w in (md, self.chk_pdf, self.chk_docx, self.chk_odt):
+        for w in (self.chk_md, self.chk_pdf, self.chk_docx, self.chk_odt):
             zeile.addWidget(w)
         zeile.addStretch()
         raster.addLayout(zeile, 0, 0, 1, 3)
+        self.chk_zusammen = QCheckBox("Alle Dateien zu einer Datei zusammenfügen "
+                                      "(Reihenfolge wird vor dem Start abgefragt)")
+        raster.addWidget(self.chk_zusammen, 3, 0, 1, 3)
         self.chk_ziel = QCheckBox("Ausgabe-Ordner:")
         self.ed_ziel = QLineEdit()
         self.btn_ziel = QPushButton("Wählen …")
@@ -170,6 +252,7 @@ class OcrGui(QWidget):
         raster.addWidget(_hinweis("Ohne Ausgabe-Ordner landen die Ergebnisse neben der Originaldatei."),
                          2, 0, 1, 3)
         self.chk_ziel.toggled.connect(self._umschalten)
+        self.chk_ueberwachen.toggled.connect(self._umschalten)
         haupt.addWidget(gruppe)
 
         # Start / Fortschritt
@@ -220,6 +303,9 @@ class OcrGui(QWidget):
         an = self.chk_ziel.isChecked()
         for w in (self.ed_ziel, self.btn_ziel):
             w.setEnabled(an)
+        # Beim Überwachen kommen Dateien einzeln an – Zusammenfügen ergibt dort keinen Sinn
+        self.chk_zusammen.setEnabled(not (self.chk_eingabe.isChecked()
+                                          and self.chk_ueberwachen.isChecked()))
 
     def _einstellungen_laden(self):
         try:
@@ -232,6 +318,7 @@ class OcrGui(QWidget):
         self.cb_modell.setCurrentText(e.get("modell", ""))
         if e.get("modus") in MODI:
             self.cb_modus.setCurrentText(e["modus"])
+        self.chk_md.setChecked(e.get("md", True))
         self.chk_pdf.setChecked(e.get("pdf", True))
         self.chk_docx.setChecked(e.get("docx", False))
         self.chk_odt.setChecked(e.get("odt", False))
@@ -240,15 +327,18 @@ class OcrGui(QWidget):
         self.chk_eingabe.setChecked(e.get("eingabe_eigen", False))
         self.ed_eingabe.setText(e.get("eingabe", ""))
         self.chk_ueberwachen.setChecked(e.get("ueberwachen", False))
+        self.chk_zusammen.setChecked(e.get("zusammen", False))
         self._umschalten()
 
     def _einstellungen_speichern(self):
         daten = dict(url=self.ed_url.text(), modell=self.cb_modell.currentText(),
-                     modus=self.cb_modus.currentText(), pdf=self.chk_pdf.isChecked(),
+                     modus=self.cb_modus.currentText(), md=self.chk_md.isChecked(),
+                     pdf=self.chk_pdf.isChecked(),
                      docx=self.chk_docx.isChecked(), odt=self.chk_odt.isChecked(),
                      ziel_eigen=self.chk_ziel.isChecked(), ziel=self.ed_ziel.text(),
                      eingabe_eigen=self.chk_eingabe.isChecked(), eingabe=self.ed_eingabe.text(),
-                     ueberwachen=self.chk_ueberwachen.isChecked())
+                     ueberwachen=self.chk_ueberwachen.isChecked(),
+                     zusammen=self.chk_zusammen.isChecked())
         try:  # API-Key wird bewusst nicht gespeichert
             EINSTELLUNGEN.write_text(json.dumps(daten, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception:
@@ -331,11 +421,28 @@ class OcrGui(QWidget):
             if antwort != QMessageBox.StandardButton.Yes:
                 return
             formate = []
+        md, pdf = self.chk_md.isChecked(), self.chk_pdf.isChecked()
+        if not (md or pdf or formate):
+            QMessageBox.information(self, "Keine Ausgabe gewählt",
+                                    "Bitte mindestens ein Ausgabeformat wählen "
+                                    "(Markdown, PDF, Word oder LibreOffice).")
+            return
         ziel = Path(self.ed_ziel.text()) if self.chk_ziel.isChecked() and self.ed_ziel.text().strip() else None
+        ueberwachen = bool(eingabe) and self.chk_ueberwachen.isChecked()
+        alle = bool(eingabe) and self.chk_alle.isChecked()
+        zusammen = None
+        if self.chk_zusammen.isChecked() and not ueberwachen:
+            kandidaten = [Path(d) for d in dateien]
+            if eingabe:
+                kandidaten += [d for d, _ in ocr.offene_dateien(eingabe, ziel, alle)
+                               if d not in kandidaten]
+            if len(kandidaten) >= 2:
+                zusammen = self._reihenfolge_abfragen(kandidaten, ziel)
+                if zusammen is None:
+                    return          # abgebrochen
         einstellungen = dict(modell=modell, prompt=MODI.get(self.cb_modus.currentText(), "grounding"),
-                             pdf=self.chk_pdf.isChecked(), formate=formate, ziel_ordner=ziel,
-                             eingabe=eingabe, ueberwachen=bool(eingabe) and self.chk_ueberwachen.isChecked(),
-                             alle=bool(eingabe) and self.chk_alle.isChecked())
+                             md=md, pdf=pdf, formate=formate, ziel_ordner=ziel,
+                             eingabe=eingabe, ueberwachen=ueberwachen, alle=alle, zusammen=zusammen)
         self._einstellungen_speichern()
         ocr.verbinden(self.ed_url.text().strip(), self.ed_key.text().strip() or None)
 
@@ -346,19 +453,39 @@ class OcrGui(QWidget):
         self.arbeiter = threading.Thread(target=self._arbeiten, args=(dateien, einstellungen), daemon=True)
         self.arbeiter.start()
 
+    def _reihenfolge_abfragen(self, dateien, ziel):
+        """Dialog „Reihenfolge festlegen“. Liefert (Dateien, Name) oder None bei Abbruch."""
+        dialog = ReihenfolgeDialog(dateien, f"{dateien[0].stem}-zusammen", self)
+        while dialog.exec() == QDialog.DialogCode.Accepted:
+            reihe, name = dialog.dateien(), dialog.name()
+            ordner = ziel or reihe[0].parent
+            vorhanden = [p.name for e in ocr.AUSGABE_ENDUNGEN
+                         if (p := Path(ordner) / f"{name}.ocr{e}").exists()]
+            if vorhanden:
+                antwort = QMessageBox.question(
+                    self, "Datei überschreiben?",
+                    "Diese Dateien gibt es schon und würden überschrieben:\n\n"
+                    + "\n".join(vorhanden) + "\n\nTrotzdem fortfahren?")
+                if antwort != QMessageBox.StandardButton.Yes:
+                    continue        # zurück zum Dialog, z. B. anderen Namen wählen
+            return reihe, name
+        return None
+
     def abbrechen(self):
         self.abbruch.set()
         self.lbl_status.setText("Wird nach der aktuellen Seite abgebrochen …")
         self.btn_abbruch.setEnabled(False)
 
     # --------------------------------------------------- Hintergrund-Thread ---
-    def _datei(self, d: Path, e, i, n, **kwargs) -> bool:
-        """Eine Datei verarbeiten. True bei Erfolg; Abgebrochen wird durchgereicht."""
+    def _datei(self, d, e, i, n, **kwargs) -> bool:
+        """Eine Datei verarbeiten (d kann auch eine Liste zum Zusammenfügen sein).
+        True bei Erfolg; Abgebrochen wird durchgereicht."""
         self.position = (i, n)
+        beschriftung = kwargs.get("name") if isinstance(d, list) else d.name
         try:
             erzeugt = ocr.verarbeiten(
                 e["modell"], d, e["prompt"], pdf=e["pdf"], formate=e["formate"],
-                ziel_ordner=e["ziel_ordner"], anzeige=self.anzeige,
+                ziel_ordner=e["ziel_ordner"], anzeige=self.anzeige, md=e["md"],
                 melden=lambda t: self.nachrichten.put(("log", t)),
                 abbrechen=self.abbruch.is_set, **kwargs)
             if erzeugt:
@@ -367,17 +494,25 @@ class OcrGui(QWidget):
         except ocr.Abgebrochen:
             raise
         except ocr.SeitenFehler as f:
-            self.nachrichten.put(("log", f"✖ {d.name}: {f} – der Rest wurde gespeichert."))
+            self.nachrichten.put(("log", f"✖ {beschriftung}: {f} – der Rest wurde gespeichert."))
             if f.erzeugt:
                 self.nachrichten.put(("ordner", f.erzeugt[0].parent))
         except Exception as f:
-            self.nachrichten.put(("log", f"✖ Fehler bei {d.name}: {f}"))
+            self.nachrichten.put(("log", f"✖ Fehler bei {beschriftung}: {f}"))
             self.nachrichten.put(("log", traceback.format_exc(limit=2)))
         return False
 
     def _arbeiten(self, dateien, e):
         stand = dict(ok=0, fehler=[])
         try:
+            if e["zusammen"]:
+                reihe, name = e["zusammen"]
+                erfolg = self._datei(reihe, e, 0, 1, name=name)
+                if erfolg:
+                    stand["ok"] += 1
+                else:
+                    stand["fehler"].append(name)
+                dateien, e = [], dict(e, eingabe=None)   # Ordner-Dateien sind schon dabei
             belegt = set()   # verhindert, dass sich gleichnamige Dateien überschreiben
             for i, d in enumerate(dateien):
                 self._zaehlen(stand, Path(d), self._datei(Path(d), e, i, len(dateien), belegt=belegt))

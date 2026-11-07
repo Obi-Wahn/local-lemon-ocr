@@ -10,6 +10,7 @@ Beispiele:
   python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 a.pdf b.pdf -o Ergebnisse --pdf
   python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 -e Eingang -o Ergebnisse --pdf
   python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 -e Eingang -o Ergebnisse --pdf --ueberwachen
+  python ocr.py user.LightOnOCR-3-4B-GGUF-Q8_0 s1.pdf s2.pdf s3.png -z Gesamt --pdf --docx --ohne-md
   python ocr.py user.PaddleOCR-VL-1.6-GGUF scan.png -p "OCR:"
 
 Ohne Prompt nutzt das Skript den "grounding"-Modus von LightOnOCR-3: Das Modell
@@ -30,6 +31,10 @@ Word und LibreOffice eingefügt. Für andere Modelle eigenen Prompt angeben.
                  (bereits erledigte werden übersprungen, außer mit --alle)
 -o ORDNER        Ausgabe-Ordner (Standard: neben der Originaldatei)
 --ueberwachen    Eingabe-Ordner laufend auf neue Dateien prüfen (Strg+C beendet)
+--ohne-md        keine Markdown-Datei (nur PDF/Word/LibreOffice)
+-z NAME          alle Dateien in der angegebenen Reihenfolge zu einem Ergebnis
+                 NAME.ocr.pdf/.docx/… zusammenfügen (mit -e: offene Dateien des
+                 Ordners alphabetisch dahinter)
 
 Den genauen Modellnamen zeigt:  lemonade list
 """
@@ -648,22 +653,26 @@ def _pandoc(befehl, **kwargs) -> str:
         raise RuntimeError(f"Pandoc-Fehler: {meldung}") from None
 
 
-def office_export(md_datei: Path, formate, melden=_melden):
-    """Markdown -> HTML -> DOCX/ODT über Pandoc.
-    Der Umweg über HTML erhält Tabellen, die das Modell als HTML ausgibt;
-    --mathml macht aus LaTeX-Formeln echte Office-Formeln."""
+def office_export(markdown: str, basis: Path, formate, melden=_melden):
+    """Markdown -> HTML -> DOCX/ODT über Pandoc, Ziel: basis + ".docx" usw.
+    (basis z. B. Ergebnisse/Beispiel.ocr). Der Markdown-Text geht über stdin an
+    Pandoc, eine .md-Datei ist also nicht nötig; Bildpfade gelten relativ zum
+    Ordner von basis. Der Umweg über HTML erhält Tabellen, die das Modell als
+    HTML ausgibt; --mathml macht aus LaTeX-Formeln echte Office-Formeln."""
     pandoc = shutil.which("pandoc")
     if not pandoc:
         melden("Pandoc nicht gefunden – installieren mit: winget install JohnMacFarlane.Pandoc")
         return []
-    html_text = _pandoc([pandoc, "-f", "markdown", "-t", "html", "--mathml", str(md_datei)],
-                        cwd=md_datei.parent)
+    basis = Path(basis)
+    ordner = basis.parent.resolve()
+    html_text = _pandoc([pandoc, "-f", "markdown", "-t", "html", "--mathml"],
+                        input=markdown, cwd=ordner)
     erzeugt = []
     for fmt in formate:
-        ziel = md_datei.with_suffix("." + fmt)   # scan.ocr.md -> scan.ocr.docx
+        ziel = Path(f"{basis}.{fmt}")   # nicht with_suffix(): das ersetzte ".ocr"
         _pandoc([pandoc, "-f", "html", "-o", str(ziel.resolve()),
-                 "--resource-path", str(md_datei.parent.resolve())],
-                input=html_text, cwd=md_datei.parent)
+                 "--resource-path", str(ordner)],
+                input=html_text, cwd=ordner)
         melden(f"Gespeichert: {ziel}")
         erzeugt.append(ziel)
     return erzeugt
@@ -703,17 +712,36 @@ def ordner_dateien(eingabe: Path) -> list[Path]:
                   key=lambda p: p.name.lower())
 
 
+AUSGABE_ENDUNGEN = (".md", ".pdf", ".docx", ".odt")
+
+
 def ist_erledigt(datei: Path, ordner: Path, name: str) -> bool:
-    """True, wenn es schon ein vollständiges Markdown-Ergebnis gibt, das neuer
-    ist als die Datei. Teilergebnisse (Abbruch, fehlende Seiten) zählen nicht."""
-    md = Path(ordner) / f"{name}.ocr.md"
+    """True, wenn es schon ein Ergebnis (name.ocr.md/.pdf/.docx/.odt) gibt, das
+    neuer ist als die Datei. Liegt ein neueres Markdown dabei, entscheidet es:
+    Teilergebnisse (Abbruch, fehlende Seiten) zählen nicht. Ohne Markdown-Ausgabe
+    wird ein Teilergebnis trotzdem als .md gespeichert (siehe _speichern())."""
     try:
-        if md.stat().st_mtime < Path(datei).stat().st_mtime:
-            return False
-        text = md.read_text(encoding="utf-8")
+        stand = Path(datei).stat().st_mtime
+    except OSError:
+        return False
+    neuer = []
+    for endung in AUSGABE_ENDUNGEN:
+        try:
+            if (Path(ordner) / f"{name}.ocr{endung}").stat().st_mtime >= stand:
+                neuer.append(endung)
+        except OSError:
+            pass
+    if ".md" not in neuer:
+        return bool(neuer)
+    try:
+        text = (Path(ordner) / f"{name}.ocr.md").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return False
-    return UNVOLLSTAENDIG not in text and SEITE_FEHLT not in text
+    return not ist_unvollstaendig(text)
+
+
+def ist_unvollstaendig(text: str) -> bool:
+    return UNVOLLSTAENDIG in text or SEITE_FEHLT in text
 
 
 class Wartezimmer:
@@ -772,39 +800,87 @@ class SeitenFehler(Exception):
         super().__init__("Seite(n) " + ", ".join(map(str, seiten)) + " nicht erkannt")
 
 
-def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool = False,
+def seiten_zusammenfuegen(dateien) -> tuple[fitz.Document, list[tuple[Path, int, int]]]:
+    """Alle Dateien in der angegebenen Reihenfolge zu einem Dokument zusammenfügen.
+    Liefert das Dokument und pro Seite (Quelldatei, Seite in der Quelle, Seiten der Quelle)."""
+    doc, herkunft = fitz.open(), []
+    for d in dateien:
+        quelle = seiten_laden(Path(d))
+        doc.insert_pdf(quelle)        # übernimmt auch die Drehung der Seiten
+        herkunft += [(Path(d), nr, quelle.page_count) for nr in range(1, quelle.page_count + 1)]
+    return doc, herkunft
+
+
+def seitenmarke(herkunft, nr: int) -> str:
+    """Unsichtbare Seitenmarke im Markdown (HTML-Kommentar), z. B. "<!-- Seite 2 -->".
+    In Word/LibreOffice erscheint sie nicht; so bleibt der Text ohne eine sichtbare
+    Überschrift „Seite 1“, und im Markdown sieht man trotzdem, wo eine Seite beginnt."""
+    quelle, seite, _ = herkunft[nr - 1]
+    if len({q for q, _, _ in herkunft}) > 1:
+        return f"<!-- {quelle.name}, Seite {seite} -->"
+    return f"<!-- Seite {seite} -->"
+
+
+def verarbeiten(modell: str, datei, prompt: str = "grounding", pdf: bool = False,
                 formate=(), ziel_ordner: Path | None = None, melden=_melden,
                 fortschritt=None, abbrechen=None, belegt: set | None = None,
-                name: str | None = None, anzeige: Fortschritt | None = None) -> list[Path]:
+                name: str | None = None, anzeige: Fortschritt | None = None,
+                md: bool = True) -> list[Path]:
     """Eine Datei komplett verarbeiten. Liefert die erzeugten Dateien.
+    datei kann auch eine Liste von Dateien sein: Dann werden sie in dieser
+    Reihenfolge zu einem Ergebnis zusammengefügt (ein PDF, ein Markdown, eine
+    Word-Datei …); Name ohne Angabe: <erste Datei>-zusammen.
     fortschritt(seite, gesamt) und abbrechen() -> bool sind optional (für die GUI).
     belegt: Menge der in diesem Durchlauf schon vergebenen Ausgabenamen,
     name: fester Ausgabename (z. B. aus offene_dateien()),
-    anzeige: Fortschritt-Objekt für eine Live-Anzeige (Laufzeit, Zeichen, Restzeit).
+    anzeige: Fortschritt-Objekt für eine Live-Anzeige (Laufzeit, Zeichen, Restzeit),
+    md: Markdown-Datei speichern (bei Teilergebnissen wird sie immer gespeichert).
 
     Scheitert eine einzelne Seite (z. B. Zeitüberschreitung), geht es mit der
     nächsten weiter; am Ende kommt SeitenFehler. Bei Abbruch oder einem Fehler,
     der alle Seiten beträfe, wird das bisher Erkannte trotzdem gespeichert."""
-    datei = Path(datei)
-    ordner = Path(ziel_ordner) if ziel_ordner else datei.parent
+    dateien = [Path(d) for d in datei] if isinstance(datei, (list, tuple)) else [Path(datei)]
+    if not dateien:
+        raise ValueError("Keine Datei angegeben.")
+    zusammen = len(dateien) > 1
+    ordner = Path(ziel_ordner) if ziel_ordner else dateien[0].parent
     ordner.mkdir(parents=True, exist_ok=True)
-    name = name or ausgabe_name(datei, ordner, belegt)
+    if not name:
+        vorlage = dateien[0].with_name(dateien[0].stem + "-zusammen.pdf") if zusammen else dateien[0]
+        name = ausgabe_name(vorlage, ordner, belegt)
     basis = str(ordner / (name + ".ocr"))   # + ".md", ".pdf" …
     bild_ordner = ordner / (name + ".ocr-bilder")
 
-    doc = seiten_laden(datei)
+    if zusammen:
+        melden(f"Füge {len(dateien)} Dateien zu {name} zusammen: "
+               + ", ".join(d.name for d in dateien))
+        doc, herkunft = seiten_zusammenfuegen(dateien)
+    else:
+        doc = seiten_laden(dateien[0])
+        herkunft = [(dateien[0], nr, doc.page_count) for nr in range(1, doc.page_count + 1)]
     gesamt = doc.page_count
     teile, fehlend, mit_text = [], [], []
     fertig = 0
     anzeige = anzeige or Fortschritt()
+
+    def seite_anfuegen(nr, inhalt):
+        if gesamt > 1:
+            teile.append(seitenmarke(herkunft, nr))
+        teile.append(inhalt)
+
     try:
         for nr, seite in enumerate(doc, start=1):
             if abbrechen and abbrechen():
                 raise Abgebrochen()
-            melden(f"→ {datei.name}: Seite {nr}/{gesamt} …")
+            quelle, nr_quelle, seiten_quelle = herkunft[nr - 1]
+            if zusammen:
+                melden(f"→ {quelle.name}: Seite {nr_quelle}/{seiten_quelle} "
+                       f"(gesamt {nr}/{gesamt}) …")
+            else:
+                melden(f"→ {quelle.name}: Seite {nr}/{gesamt} …")
             if fortschritt:
                 fortschritt(nr - 1, gesamt)
-            anzeige.seite_beginnt(datei.name, nr, gesamt)
+            anzeige.seite_beginnt(f"{name} ({quelle.name})" if zusammen else quelle.name, nr, gesamt)
             try:
                 antwort, bloecke, hinweis = seite_erkennen(modell, seite_als_png(seite), prompt,
                                                   empfangen=anzeige.empfangen, melden=melden)
@@ -816,7 +892,8 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
                 if fehler_hinweis(f):
                     melden(f"     {fehler_hinweis(f)}")
                 fehlend.append(nr)
-                teile.append(f"## Seite {nr}\n\n*{SEITE_FEHLT} – {type(f).__name__}]*")
+                wo = f"{quelle.name}, Seite {nr_quelle}" if zusammen else f"Seite {nr}"
+                seite_anfuegen(nr, f"*{SEITE_FEHLT} – {wo}, {type(f).__name__}]*")
                 fertig = nr
                 continue
             dauer = anzeige.seite_fertig()
@@ -829,7 +906,7 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
             if hinweis and not inhalt.strip():
                 inhalt = f"*{hinweis}*"
                 melden(f"   ⚠ Seite {nr}: {hinweis[1:-1]}")
-            teile.append(f"## Seite {nr}\n\n{inhalt}")
+            seite_anfuegen(nr, inhalt)
             if pdf:
                 # Bilder als eigene Objekte deckungsgleich an die Originalstelle legen
                 bilder_einfuegen(seite, bilder)
@@ -846,7 +923,7 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
             grund = "abgebrochen" if isinstance(f, (Abgebrochen, KeyboardInterrupt)) else "Fehler"
             teile.append(f"*{UNVOLLSTAENDIG}: {grund} nach Seite {fertig} von {gesamt}]*")
             melden(f"   Teilergebnis wird gespeichert ({fertig} von {gesamt} Seiten) …")
-            _speichern(doc, teile, basis, pdf, (), melden)
+            _speichern(doc, teile, basis, pdf, (), melden, md=True)
         raise
     anzeige.ende()
     if fortschritt:
@@ -854,18 +931,25 @@ def verarbeiten(modell: str, datei: Path, prompt: str = "grounding", pdf: bool =
     if mit_text:
         melden(f"   Hinweis: Seite(n) {', '.join(map(str, mit_text))} enthielten schon Text – "
                "dort wurde keine zweite Textebene eingefügt.")
-    erzeugt = _speichern(doc, teile, basis, pdf, formate, melden)
+    if fehlend and not md:
+        melden("   Markdown wird trotzdem gespeichert, weil Seiten fehlen – "
+               "so wird die Datei beim nächsten Lauf erneut verarbeitet.")
+    erzeugt = _speichern(doc, teile, basis, pdf, formate, melden, md=md or bool(fehlend))
     if fehlend:
         raise SeitenFehler(erzeugt, fehlend)
     return erzeugt
 
 
-def _speichern(doc, teile, basis, pdf, formate, melden) -> list[Path]:
+def _speichern(doc, teile, basis, pdf, formate, melden, md: bool = True) -> list[Path]:
     erzeugt = []
+    markdown = "\n\n".join(teile)
     md_ziel = Path(basis + ".md")
-    md_ziel.write_text("\n\n".join(teile), encoding="utf-8")
-    melden(f"Gespeichert: {md_ziel}")
-    erzeugt.append(md_ziel)
+    if md:
+        md_ziel.write_text(markdown, encoding="utf-8")
+        melden(f"Gespeichert: {md_ziel}")
+        erzeugt.append(md_ziel)
+    else:
+        _altes_teilergebnis_entfernen(md_ziel, melden)
 
     if pdf:
         pdf_ziel = Path(basis + ".pdf")
@@ -876,8 +960,21 @@ def _speichern(doc, teile, basis, pdf, formate, melden) -> list[Path]:
         erzeugt.append(pdf_ziel)
 
     if formate:
-        erzeugt += office_export(md_ziel, formate, melden)
+        erzeugt += office_export(markdown, Path(basis), formate, melden)
     return erzeugt
+
+
+def _altes_teilergebnis_entfernen(md_ziel: Path, melden):
+    """Ohne Markdown-Ausgabe: Ein älteres, unvollständiges name.ocr.md aus einem
+    früheren Lauf löschen. Sonst hielte ist_erledigt() die Datei für unfertig und
+    würde sie im Eingabe-Ordner immer wieder verarbeiten. Vollständige
+    Markdown-Dateien bleiben liegen."""
+    try:
+        if ist_unvollstaendig(md_ziel.read_text(encoding="utf-8")):
+            md_ziel.unlink()
+            melden(f"Altes Teilergebnis gelöscht: {md_ziel}")
+    except (OSError, UnicodeDecodeError):
+        pass
 
 
 # ---------------------------------------------------------- Kommandozeile ---
@@ -944,6 +1041,20 @@ class Konsolenanzeige:
                 self.strom.flush()
 
 
+def zielname(text: str) -> str:
+    """Name für ein zusammengefügtes Ergebnis aus einer Eingabe wie "Beispiel",
+    "Beispiel.pdf" oder "Beispiel.ocr.docx": ohne Endung und ohne Zeichen, die
+    unter Windows in Dateinamen verboten sind."""
+    name = re.sub(r'[\\/:*?"<>|]', "_", (text or "").strip()).strip(" .")
+    for endung in (*AUSGABE_ENDUNGEN, *ENDUNGEN):
+        if name.lower().endswith(endung):
+            name = name[: -len(endung)]
+            break
+    if name.lower().endswith(".ocr"):
+        name = name[:-4]
+    return name.strip(" .")
+
+
 def _argumente(argv):
     p = argparse.ArgumentParser(
         prog="ocr.py", description="OCR über einen lokalen Lemonade Server.",
@@ -965,6 +1076,11 @@ def _argumente(argv):
     p.add_argument("--pdf", action="store_true", help="durchsuchbares PDF erzeugen")
     p.add_argument("--docx", action="store_true", help="Word-Datei erzeugen (braucht Pandoc)")
     p.add_argument("--odt", action="store_true", help="LibreOffice-Datei erzeugen (braucht Pandoc)")
+    p.add_argument("--ohne-md", action="store_true",
+                   help="keine Markdown-Datei speichern (dann --pdf, --docx oder --odt angeben)")
+    p.add_argument("-z", "--zusammen", metavar="NAME",
+                   help="alle Dateien in der angegebenen Reihenfolge zu einem Ergebnis "
+                        "NAME.ocr.pdf/.docx … zusammenfügen")
     p.add_argument("--url", default=BASE_URL, help=f"Server-Adresse (Standard {BASE_URL})")
     a = p.parse_args(argv)
 
@@ -981,6 +1097,14 @@ def _argumente(argv):
         p.error("Bitte eine Datei oder mit -e einen Eingabe-Ordner angeben.")
     if a.ueberwachen and not a.eingabe:
         p.error("--ueberwachen braucht einen Eingabe-Ordner (-e).")
+    if a.ohne_md and not (a.pdf or a.docx or a.odt):
+        p.error("Mit --ohne-md bitte --pdf, --docx oder --odt angeben, sonst entsteht nichts.")
+    if a.zusammen is not None:
+        if a.ueberwachen:
+            p.error("--zusammen geht nicht zusammen mit --ueberwachen.")
+        a.zusammen = zielname(a.zusammen)
+        if not a.zusammen:
+            p.error("--zusammen braucht einen Namen, z. B. --zusammen Beispiel")
     if a.eingabe and not a.eingabe.is_dir():
         p.error(f"Eingabe-Ordner nicht gefunden: {a.eingabe}")
     fehlt = [d for d in a.dateien if not Path(d).is_file()]
@@ -1008,19 +1132,32 @@ def main(argv=None):
         try:
             letztes = verarbeiten(a.modell, d, a.prompt, pdf=a.pdf, formate=formate,
                                   ziel_ordner=a.ausgabe, melden=melden, anzeige=fortschritt,
-                                  **kwargs)
+                                  md=not a.ohne_md, **kwargs)
             return True
         except SeitenFehler as f:
-            melden(f"✖ {d.name}: {f}")
+            melden(f"✖ {beschriftung(d)}: {f}")
         except Abgebrochen:
             raise
         except Exception as f:
-            melden(f"✖ Fehler bei {d.name}: {f}")
+            melden(f"✖ Fehler bei {beschriftung(d)}: {f}")
         fehler += 1
         return False
 
+    def beschriftung(d) -> str:
+        return a.zusammen if isinstance(d, list) else d.name
+
     try:
         belegt = set()
+        if a.zusammen:
+            # Reihenfolge wie angegeben, danach die offenen Dateien des Eingabe-Ordners
+            alle = [Path(d) for d in a.dateien]
+            if a.eingabe:
+                alle += [d for d, _ in offene_dateien(a.eingabe, a.ausgabe, a.alle)]
+            if not alle:
+                melden("Keine offenen Dateien zum Zusammenfügen.")
+            else:
+                eine_datei(alle, name=a.zusammen)
+            a.dateien, a.eingabe = [], None
         for d in a.dateien:
             eine_datei(Path(d), belegt=belegt)
         if a.eingabe:
@@ -1046,7 +1183,7 @@ def main(argv=None):
         sys.exit(130)
     konsole.beenden()
 
-    if len(a.dateien) == 1 and not a.eingabe and letztes:
+    if len(a.dateien) == 1 and not a.eingabe and letztes and letztes[0].suffix == ".md":
         print(letztes[0].read_text(encoding="utf-8"))
     sys.exit(1 if fehler else 0)
 
