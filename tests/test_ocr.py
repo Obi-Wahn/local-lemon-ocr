@@ -7,9 +7,11 @@ Aufruf im Projektordner:   python -m unittest discover -s tests -v
 import io
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
+import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -221,7 +223,7 @@ class SeitenfehlerTest(Grundlage):
                 ocr.verarbeiten("x", self.scan(seiten=3), pdf=True, melden=STILL)
         self.assertEqual(f.exception.seiten, [2])
         md = (self.tmp / "Beispiel.ocr.md").read_text(encoding="utf-8")
-        self.assertIn("## Seite 3", md)
+        self.assertIn("<!-- Seite 3 -->", md)
         self.assertIn(ocr.SEITE_FEHLT, md)
         self.assertEqual(len(fitz.open(self.tmp / "Beispiel.ocr.pdf")), 3)
         self.assertFalse(ocr.ist_erledigt(self.tmp / "Beispiel.pdf", self.tmp, "Beispiel"))
@@ -253,8 +255,8 @@ class SeitenfehlerTest(Grundlage):
             with self.assertRaises(openai.APIConnectionError):
                 ocr.verarbeiten("x", self.scan(seiten=4), pdf=True, melden=STILL)
         md = (self.tmp / "Beispiel.ocr.md").read_text(encoding="utf-8")
-        self.assertIn("## Seite 2", md)
-        self.assertNotIn("## Seite 3", md)
+        self.assertIn("<!-- Seite 2 -->", md)
+        self.assertNotIn("<!-- Seite 3 -->", md)
         self.assertIn(ocr.UNVOLLSTAENDIG, md)
 
     def test_abbruch_speichert_teilergebnis(self):
@@ -308,6 +310,75 @@ class NamenUndOrdnerTest(Grundlage):
         with datei.open("ab") as f:
             f.write(b"\n")
         self.assertFalse(w.bereit(datei))   # wird noch geschrieben
+
+
+class AusgabeTest(Grundlage):
+    """Keine Überschrift „Seite 1“, Markdown optional, mehrere Dateien zusammenfügen."""
+
+    def test_keine_seitenueberschrift(self):
+        md = ocr.verarbeiten("x", self.scan(), melden=STILL)[0].read_text(encoding="utf-8")
+        self.assertNotIn("Seite", md)
+        self.assertTrue(md.startswith("# Beispiel für eine Testseite"))
+        md = ocr.verarbeiten("x", self.scan(seiten=2), melden=STILL)[0].read_text(encoding="utf-8")
+        self.assertNotIn("## Seite", md)
+        self.assertIn("<!-- Seite 2 -->", md)   # unsichtbare Seitenmarke
+
+    def test_ohne_markdown(self):
+        erzeugt = ocr.verarbeiten("x", self.scan(), pdf=True, md=False, melden=STILL)
+        self.assertEqual([p.name for p in erzeugt], ["Beispiel.ocr.pdf"])
+        self.assertFalse((self.tmp / "Beispiel.ocr.md").exists())
+        self.assertTrue(ocr.ist_erledigt(self.tmp / "Beispiel.pdf", self.tmp, "Beispiel"))
+
+    def test_ohne_markdown_teilergebnis_bleibt_markiert(self):
+        aufrufe = []
+
+        def ocr_mit_fehler(modell, png, prompt, empfangen=None):
+            aufrufe.append(1)
+            if len(aufrufe) == 2:
+                raise zeitueberschreitung()
+            return self.antwort
+
+        with mock.patch.object(ocr, "ocr", ocr_mit_fehler):
+            with self.assertRaises(ocr.SeitenFehler):
+                ocr.verarbeiten("x", self.scan(seiten=2), pdf=True, md=False, melden=STILL)
+        # Markdown trotzdem da, damit die Datei als unvollständig gilt
+        self.assertTrue((self.tmp / "Beispiel.ocr.md").exists())
+        self.assertFalse(ocr.ist_erledigt(self.tmp / "Beispiel.pdf", self.tmp, "Beispiel"))
+        # nächster, vollständiger Lauf ohne Markdown räumt das Teilergebnis weg
+        ocr.verarbeiten("x", self.tmp / "Beispiel.pdf", pdf=True, md=False, melden=STILL)
+        self.assertFalse((self.tmp / "Beispiel.ocr.md").exists())
+        self.assertTrue(ocr.ist_erledigt(self.tmp / "Beispiel.pdf", self.tmp, "Beispiel"))
+
+    def test_zusammenfuegen(self):
+        a = self.scan("Erstes.pdf", seiten=2)
+        b = self.scan("Zweites.pdf", drehung=90)
+        png = self.tmp / "Drittes.png"
+        png.write_bytes(self.original[0].get_pixmap(dpi=100).tobytes("png"))
+        aus = self.tmp / "aus"
+        erzeugt = ocr.verarbeiten("x", [b, png, a], pdf=True, ziel_ordner=aus,
+                                  name="Gesamt", melden=STILL)
+        self.assertEqual([p.name for p in erzeugt], ["Gesamt.ocr.md", "Gesamt.ocr.pdf"])
+        doc = fitz.open(erzeugt[1])
+        self.assertEqual(len(doc), 4)
+        self.assertEqual(doc[0].rotation, 90)     # Drehung bleibt erhalten
+        for seite in doc:
+            self.assertIn("Testseite", seite.get_text())
+        md = erzeugt[0].read_text(encoding="utf-8")
+        marken = [z for z in md.splitlines() if z.startswith("<!--")]
+        self.assertEqual(marken, ["<!-- Zweites.pdf, Seite 1 -->", "<!-- Drittes.png, Seite 1 -->",
+                                  "<!-- Erstes.pdf, Seite 1 -->", "<!-- Erstes.pdf, Seite 2 -->"])
+        # Bilder aller Seiten mit eindeutigen Namen
+        self.assertEqual(len(list((aus / "Gesamt.ocr-bilder").glob("*.png"))), 4)
+
+    def test_zusammenfuegen_standardname(self):
+        erzeugt = ocr.verarbeiten("x", [self.scan("Erstes.pdf"), self.scan("Zweites.pdf")],
+                                  melden=STILL)
+        self.assertEqual(erzeugt[0].name, "Erstes-zusammen.ocr.md")
+
+    def test_zielname(self):
+        for eingabe, name in (("Beispiel", "Beispiel"), ("Beispiel.pdf", "Beispiel"),
+                              ("Beispiel.ocr.docx", "Beispiel"), ("a/b:c", "a_b_c"), (" . ", "")):
+            self.assertEqual(ocr.zielname(eingabe), name)
 
 
 class KommandozeileTest(Grundlage):
@@ -367,6 +438,19 @@ class KommandozeileTest(Grundlage):
             code, _, err = self.starten("m", "-e", str(ein), "-o", str(aus), "--ueberwachen")
         self.assertEqual(code, 130)
         self.assertEqual(sorted(p.name for p in aus.glob("*.ocr.md")), ["Erstes.ocr.md", "Neu.ocr.md"])
+
+    def test_zusammen_ohne_markdown(self):
+        a, b = self.scan("Erstes.pdf"), self.scan("Zweites.pdf")
+        code, aus, err = self.starten("m", str(b), str(a), "-z", "Gesamt.pdf", "--pdf", "--ohne-md")
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.tmp / "Gesamt.ocr.pdf").exists())
+        self.assertEqual(len(fitz.open(self.tmp / "Gesamt.ocr.pdf")), 2)
+        self.assertEqual(list(self.tmp.glob("*.ocr.md")), [])
+        self.assertFalse((self.tmp / "Erstes.ocr.pdf").exists())
+
+    def test_ohne_markdown_braucht_anderes_format(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            ocr._argumente(["m", str(self.scan()), "--ohne-md"])
 
     def test_ausgabe_als_utf8(self):
         code, aus, _ = self.starten("m", str(self.scan()))
@@ -491,6 +575,19 @@ class PandocTest(Grundlage):
         erzeugt = ocr.verarbeiten("x", self.scan(), formate=("docx", "odt"), melden=STILL)
         self.assertEqual([p.name for p in erzeugt],
                          ["Beispiel.ocr.md", "Beispiel.ocr.docx", "Beispiel.ocr.odt"])
+
+    def test_word_ohne_markdown_und_ohne_seitenmarken(self):
+        erzeugt = ocr.verarbeiten("x", [self.scan("Erstes.pdf", seiten=2), self.scan("Zweites.pdf")],
+                                  formate=("docx",), md=False, name="Gesamt", melden=STILL)
+        self.assertEqual([p.name for p in erzeugt], ["Gesamt.ocr.docx"])
+        text = subprocess.run([shutil.which("pandoc"), "-t", "plain", str(erzeugt[0])],
+                              capture_output=True, text=True, encoding="utf-8", check=True).stdout
+        self.assertEqual(text.count("Beispiel für eine Testseite"), 3)
+        self.assertNotIn("Seite 1", text)
+        self.assertNotIn("Erstes.pdf", text)
+        # Bild aus dem Bildordner ist eingebettet
+        with zipfile.ZipFile(erzeugt[0]) as z:
+            self.assertEqual(len([n for n in z.namelist() if n.startswith("word/media/")]), 3)
 
     def test_fehlermeldung_von_pandoc(self):
         with self.assertRaises(RuntimeError) as f:
