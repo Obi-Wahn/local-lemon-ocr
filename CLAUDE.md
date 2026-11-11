@@ -55,4 +55,4 @@ Es gibt keinen echten Server in CI. Die Tests liegen in `tests/` und laufen mit 
 - Mögliche Erweiterungen: Paperless-Integration, englische Übersetzung von README und Oberfläche.
 
 ## Datenschutz
-Keine persönlichen Daten in Code, Doku, Tests oder Beispielen. Beispieldateien nur neutral benennen (z. B. `Beispiel.pdf`). Die `.gitignore` schließt PDFs, Bilder, Office-Dateien, `*.ocr.md`, `*.ocr-bilder/`, `Eingang/`, `Ergebnisse/` und `.ocr-gui.json` aus, erlaubt aber alles in `docs/`. Tests erzeugen ihre Dateien nur in temporären Ordnern.
+Keine persönlichen Daten in Code, Doku, Tests oder Beispielen. Beispieldateien nur neutral benennen (z. B. `Beispiel.pdf`). Die `.gitignore` schließt PDFs, Bilder, Office-Dateien, `*.ocr.md`, `*.ocr-bilder/`, `Eingang/`, `Ergebnisse/`, `.ocr-gui.json` und lokale Claude-Code-Einstellungen (`.claude/settings.local.json`, können Zugangsdaten enthalten) aus, erlaubt aber alles in `docs/`. Tests erzeugen ihre Dateien nur in temporären Ordnern.
